@@ -695,6 +695,29 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Pre-warm: cache the agent container image in Docker daemon memory so the
+  // first real spawn skips the layer-load cost (~2-5s saved on cold boot).
+  // This is a no-op `true` invocation — the container starts and immediately
+  // exits. Subsequent real spawns reuse cached image layers.
+  // Only runs if at least one registered group has containerConfig.preWarm = true.
+  const preWarmGroups = Object.values(registeredGroups).filter(
+    (g) => g.containerConfig?.preWarm === true,
+  );
+  if (preWarmGroups.length > 0) {
+    const { spawn } = await import('child_process');
+    const { CONTAINER_IMAGE } = await import('./config.js');
+    spawn('docker', ['run', '--rm', CONTAINER_IMAGE, 'true'], {
+      detached: true,
+      stdio: 'ignore',
+    }).on('error', (err) => {
+      logger.debug({ err }, 'Pre-warm spawn failed (non-fatal)');
+    });
+    logger.info(
+      { groups: preWarmGroups.map((g) => g.folder), image: CONTAINER_IMAGE },
+      'Pre-warming agent container image cache',
+    );
+  }
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -717,6 +740,36 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
+    },
+    sendMessageWithKeyboard: (jid, text, keyboard) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendMessageWithKeyboard) {
+        throw new Error(
+          `Channel ${channel.name} does not support sendMessageWithKeyboard`,
+        );
+      }
+      return channel.sendMessageWithKeyboard(jid, text, keyboard);
+    },
+    editMessage: (jid, messageId, text, keyboard) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.editMessage) {
+        throw new Error(
+          `Channel ${channel.name} does not support editMessage`,
+        );
+      }
+      return channel.editMessage(jid, messageId, text, keyboard);
+    },
+    deleteMessage: (jid, messageId) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.deleteMessage) {
+        throw new Error(
+          `Channel ${channel.name} does not support deleteMessage`,
+        );
+      }
+      return channel.deleteMessage(jid, messageId);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

@@ -1117,11 +1117,11 @@ describe('TelegramChannel', () => {
       await channel.connect();
 
       const handler = currentBot().commandHandlers.get('ping')!;
-      const ctx = { reply: vi.fn() };
+      const ctx = { chat: { id: 777 }, reply: vi.fn() };
 
       await handler(ctx);
 
-      expect(ctx.reply).toHaveBeenCalledWith('Andy is online.');
+      expect(ctx.reply).toHaveBeenCalledWith('Andy is online (telegram).');
     });
   });
 

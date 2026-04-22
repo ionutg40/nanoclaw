@@ -247,11 +247,20 @@ async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   agentIdentifier?: string,
+  extraEnv?: Record<string, string>,
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Per-group env (model selection, feature flags). Skip empties.
+  if (extraEnv) {
+    for (const [k, v] of Object.entries(extraEnv)) {
+      if (v == null || v === '') continue;
+      args.push('-e', `${k}=${v}`);
+    }
+  }
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
@@ -316,6 +325,7 @@ export async function runContainerAgent(
     mounts,
     containerName,
     agentIdentifier,
+    group.containerConfig?.env,
   );
 
   logger.debug(

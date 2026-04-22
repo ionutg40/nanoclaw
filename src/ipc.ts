@@ -8,10 +8,22 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { InlineKeyboard, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendMessageWithKeyboard?: (
+    jid: string,
+    text: string,
+    keyboard: InlineKeyboard,
+  ) => Promise<{ messageId: string }>;
+  editMessage?: (
+    jid: string,
+    messageId: string,
+    text: string,
+    keyboard?: InlineKeyboard | null,
+  ) => Promise<void>;
+  deleteMessage?: (jid: string, messageId: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -74,13 +86,14 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              const targetGroup = registeredGroups[data.chatJid];
+              const isAuthorized =
+                !!data.chatJid &&
+                (isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup));
+
               if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
+                if (isAuthorized) {
                   await deps.sendMessage(data.chatJid, data.text);
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
@@ -90,6 +103,117 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'message_with_keyboard' &&
+                data.chatJid &&
+                data.text &&
+                Array.isArray(data.keyboard)
+              ) {
+                if (!isAuthorized) {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC keyboard message blocked',
+                  );
+                } else if (!deps.sendMessageWithKeyboard) {
+                  logger.warn(
+                    { chatJid: data.chatJid },
+                    'Keyboard send requested but channel does not support it',
+                  );
+                } else {
+                  const res = await deps.sendMessageWithKeyboard(
+                    data.chatJid,
+                    data.text,
+                    data.keyboard as InlineKeyboard,
+                  );
+                  logger.info(
+                    {
+                      chatJid: data.chatJid,
+                      sourceGroup,
+                      messageId: res.messageId,
+                    },
+                    'IPC keyboard message sent',
+                  );
+                  // Write ack so agent can correlate message_id for future edits.
+                  const ackDir = path.join(
+                    ipcBaseDir,
+                    sourceGroup,
+                    'acks',
+                  );
+                  fs.mkdirSync(ackDir, { recursive: true });
+                  fs.writeFileSync(
+                    path.join(ackDir, `${file}.ack`),
+                    JSON.stringify({
+                      correlation_id: data.correlation_id || null,
+                      messageId: res.messageId,
+                      chatJid: data.chatJid,
+                    }),
+                  );
+                }
+              } else if (
+                data.type === 'delete_message' &&
+                data.chatJid &&
+                typeof data.messageId === 'string'
+              ) {
+                if (!isAuthorized) {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC delete_message blocked',
+                  );
+                } else if (!deps.deleteMessage) {
+                  logger.warn(
+                    { chatJid: data.chatJid },
+                    'delete_message requested but channel does not support it',
+                  );
+                } else {
+                  await deps.deleteMessage(data.chatJid, data.messageId);
+                  logger.info(
+                    {
+                      chatJid: data.chatJid,
+                      sourceGroup,
+                      messageId: data.messageId,
+                    },
+                    'IPC message deleted',
+                  );
+                }
+              } else if (
+                data.type === 'edit_message' &&
+                data.chatJid &&
+                typeof data.messageId === 'string' &&
+                typeof data.text === 'string'
+              ) {
+                if (!isAuthorized) {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC edit_message blocked',
+                  );
+                } else if (!deps.editMessage) {
+                  logger.warn(
+                    { chatJid: data.chatJid },
+                    'edit_message requested but channel does not support it',
+                  );
+                } else {
+                  // keyboard can be array / null / undefined — pass-through
+                  const kb =
+                    data.keyboard === null
+                      ? null
+                      : Array.isArray(data.keyboard)
+                      ? (data.keyboard as InlineKeyboard)
+                      : undefined;
+                  await deps.editMessage(
+                    data.chatJid,
+                    data.messageId,
+                    data.text,
+                    kb,
+                  );
+                  logger.info(
+                    {
+                      chatJid: data.chatJid,
+                      sourceGroup,
+                      messageId: data.messageId,
+                    },
+                    'IPC message edited',
                   );
                 }
               }

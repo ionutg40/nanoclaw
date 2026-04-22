@@ -1,0 +1,99 @@
+---
+name: grade-review
+description: Process Monica's CapYear grade verification queue. Use whenever the user sends `/review`, asks to "check grades", "process pending", "verify scores", or anything similar in the CapYear Grades group. Calls bot_cli.py to fetch pending decisions and presents them on Telegram with inline keyboards.
+allowed-tools: Bash, Read, Write
+---
+
+# Grade Review (CapYear)
+
+Trigger: `/review`, "check grades", "process pending", "verify scores", "let's review". For ambiguous chat, do NOT invoke — reply naturally.
+
+## Three-step flow on `/review`
+
+1. **Acknowledge** with `mcp__nanoclaw__send_message` text=`"Fetching pending submissions..."` (LW scrape can take 30-90s on the first cold call).
+
+2. **Run** the CLI and parse JSON:
+   ```bash
+   /opt/grade-verifier-venv/bin/python \
+     /workspace/extra/grade-verifier/src/bot_cli.py fetch-pending
+   ```
+   The output ALREADY includes a `render` block with `summary_md`, `keyboard`, and `session_state` — pre-formatted by Python so you don't need to format anything yourself.
+
+3. **Send** with `mcp__nanoclaw__send_message_with_keyboard(text=render.summary_md, keyboard=render.keyboard)` and **save** `render.session_state` to `/workspace/group/session_state.json`.
+
+If `success: false` or `count: 0`, send a one-liner status (use the error-code map below) and STOP.
+
+## On callback (`[callback] data=<code> original_message_id=<id>`)
+
+Load `session_state.json`, then route per `${CLAUDE_SKILL_DIR}/callback_routing.md`:
+
+| Code pattern | Action |
+|---|---|
+| `b:<group>:<token>` | For each `short_id` in `groups[token].short_ids`: run `bot_cli.py submit --id <full_id> --action <approve\|correct\|bounce> [--nha-score N]`. Then `edit_message` to status + `keyboard: null`. Show progress edits every 5+ submissions. |
+| `r:<group>:<token>` | Render the first individual card from that group (template in `formatters.md`). |
+| `a:<sid>` / `c:<sid>` / `x:<sid>` | Single submit, then `edit_message` to status. |
+| `s:<sid>` | Skip — just edit message to "_Skipped_", `keyboard: null`. No CLI call. |
+| `d:<sid>` | Show full details (PII allowed only here). Add `[← Back]` button → `back:<sid>`. |
+| `back:<sid>` / `back:summary` | Restore the previous view. |
+| `end` | Send session-close summary and clear `session_state.json`. |
+
+For exact message templates and PII-minimization rules, see `${CLAUDE_SKILL_DIR}/formatters.md`.
+
+## CLI commands
+
+```bash
+# Fast path — uses 5-min cache when available
+bot_cli.py fetch-pending          # add --force to skip cache
+
+# Single-submission action
+bot_cli.py submit --id <full_id> --action approve|correct|bounce \
+                  [--nha-score N]   # required for action=correct
+                  [--actor monica]
+
+# SUPERVISORY — ONLY when Monica explicitly says "process the backlog" or similar
+bot_cli.py process-backlog --confidence-min 0.99 [--limit N] [--dry-run]
+# Run with --dry-run first, then ask Monica to confirm before live mode.
+
+# Quick health check (no LW login)
+bot_cli.py health
+```
+
+All CLI output is JSON. Container env already includes `NOCODB_URL=http://host.docker.internal:8082`.
+
+## Error codes (map to user English)
+
+| Code | Tell Monica |
+|---|---|
+| `LW_UNREACHABLE` | "Can't reach LearnWorlds. Try again in a minute." |
+| `LW_AUTH_FAILED` | "LearnWorlds rejected our login — flag fasty." |
+| `LW_SESSION_EXPIRED` | (Auto-retry once. If still fails, escalate.) |
+| `LW_SUBMIT_TIMEOUT` | "LearnWorlds didn't confirm the submit. Refresh and verify." |
+| `LW_DOM_CHANGED` | "LearnWorlds layout changed — fasty needs to re-run the probe." |
+| `LW_UNKNOWN_SUBMISSION` | "Submission not found in LearnWorlds." |
+| `NHA_CSV_MISSING` | "NHA CSV missing. Drop a fresh export and try again." |
+| `NOCODB_WRITE_FAILED` | "Saved in LW but couldn't write the audit row — flag fasty." |
+| `NOT_IMPLEMENTED` | "Submit isn't wired up yet (selector probe pending)." |
+
+NEVER hide a partial failure — surface failed submission IDs inline.
+
+## PII handling (mandatory)
+
+Telegram is NOT end-to-end encrypted for bot chats. Messages sit in Telegram's cloud. Minimize exposure:
+
+- **Summary + individual cards:** first name + last initial + score + short assessment label. NEVER full email, full submission_id, or full student_id.
+- **Details view is the ONLY place full PII appears.** Restore the compact card on `[← Back]` (via `edit_message` — Telegram has no "delete content" primitive for in-place).
+- **After every successful submit**, call `mcp__nanoclaw__delete_message(messageId=<the original decision prompt message_id>)` so the PII-bearing prompt disappears from the chat. Status/summary messages (counts only, no PII) stay.
+- If `delete_message` fails (message >48h old or already gone), it's non-fatal — the tool is silent on those. Don't retry.
+- Don't log PII inside `<internal>` tags either — internal logs persist on the host.
+
+## Don't
+
+- Don't run `fetch-pending` more than once per `/review` (cache handles repeats).
+- Don't write to LW without an explicit Monica tap (Interactive invariant).
+- Don't include full emails / submission_ids in any message except the on-demand Details view.
+- Don't skip the post-submit `delete_message` call — PII hygiene is a policy requirement, not a nice-to-have.
+- Don't reply in any language other than English.
+
+## Idempotency on double-tap
+
+Before submitting, check if `session_state.decisions[short_id].acted_at` is set. If yes, ignore silently. Otherwise, set it AFTER the submit completes (success or error) and persist.

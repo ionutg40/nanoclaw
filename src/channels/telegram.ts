@@ -11,6 +11,7 @@ import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
+  InlineKeyboard,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
@@ -46,15 +47,27 @@ async function sendTelegramMessage(
 }
 
 export class TelegramChannel implements Channel {
-  name = 'telegram';
+  name: string;
 
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private isFallback: boolean;
+  // Chat JIDs this bot has seen inbound. Populated on every message — grammy
+  // polls per bot token, so a chat that reaches THIS bot is definitively owned
+  // by THIS instance. Used by ownsJid for outbound routing.
+  private knownChats: Set<string> = new Set();
 
-  constructor(botToken: string, opts: TelegramChannelOpts) {
+  constructor(
+    botToken: string,
+    opts: TelegramChannelOpts,
+    channelName: string = 'telegram',
+    isFallback: boolean = true,
+  ) {
     this.botToken = botToken;
+    this.name = channelName;
     this.opts = opts;
+    this.isFallback = isFallback;
   }
 
   /**
@@ -115,6 +128,7 @@ export class TelegramChannel implements Channel {
     // Command to get chat ID (useful for registration)
     this.bot.command('chatid', (ctx) => {
       const chatId = ctx.chat.id;
+      this.knownChats.add(`tg:${chatId}`);
       const chatType = ctx.chat.type;
       const chatName =
         chatType === 'private'
@@ -122,14 +136,15 @@ export class TelegramChannel implements Channel {
           : (ctx.chat as any).title || 'Unknown';
 
       ctx.reply(
-        `Chat ID: \`tg:${chatId}\`\nName: ${chatName}\nType: ${chatType}`,
+        `Chat ID: \`tg:${chatId}\`\nName: ${chatName}\nType: ${chatType}\nBot: ${this.name}`,
         { parse_mode: 'Markdown' },
       );
     });
 
     // Command to check bot status
     this.bot.command('ping', (ctx) => {
-      ctx.reply(`${ASSISTANT_NAME} is online.`);
+      this.knownChats.add(`tg:${ctx.chat.id}`);
+      ctx.reply(`${ASSISTANT_NAME} is online (${this.name}).`);
     });
 
     // Telegram bot commands handled above — skip them in the general handler
@@ -143,6 +158,9 @@ export class TelegramChannel implements Channel {
       }
 
       const chatJid = `tg:${ctx.chat.id}`;
+      // Claim ownership: this bot received a message from chatJid,
+      // so future outbound to that JID must route through THIS instance.
+      this.knownChats.add(chatJid);
       let content = ctx.message.text;
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
       const senderName =
@@ -239,6 +257,8 @@ export class TelegramChannel implements Channel {
       opts?: { fileId?: string; filename?: string },
     ) => {
       const chatJid = `tg:${ctx.chat.id}`;
+      // Claim ownership on any inbound media from this chat too.
+      this.knownChats.add(chatJid);
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
 
@@ -336,6 +356,73 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:location', (ctx) => storeMedia(ctx, '[Location]'));
     this.bot.on('message:contact', (ctx) => storeMedia(ctx, '[Contact]'));
 
+    // ---- Inline keyboard callback_query ----
+    // When the user taps a button, ack immediately (dismisses spinner) and
+    // deliver a synthetic message carrying the callback_data so the agent can
+    // act on it. Original message stays in chat with its keyboard until the
+    // agent decides to edit_message it.
+    this.bot.on('callback_query:data', async (ctx) => {
+      try {
+        await ctx.answerCallbackQuery();
+      } catch (err) {
+        logger.warn({ err }, 'answerCallbackQuery failed (non-fatal)');
+      }
+
+      const chat = ctx.chat;
+      if (!chat) {
+        logger.warn('callback_query without chat context, dropping');
+        return;
+      }
+      const chatJid = `tg:${chat.id}`;
+      this.knownChats.add(chatJid);
+
+      const data = ctx.callbackQuery.data;
+      const originalMsg = ctx.callbackQuery.message;
+      const originalMsgId = originalMsg?.message_id?.toString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const sender = ctx.from?.id?.toString() || '';
+      const timestamp = new Date().toISOString();
+      const chatName =
+        chat.type === 'private' ? senderName : (chat as any).title || chatJid;
+      const isGroup = chat.type === 'group' || chat.type === 'supergroup';
+
+      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'telegram', isGroup);
+
+      // Only deliver to registered groups — same gate as text messages.
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) {
+        logger.debug({ chatJid, data }, 'Callback from unregistered chat, dropping');
+        return;
+      }
+
+      // Synthetic content lets formatMessages render it readably even before
+      // the agent learns to read callback_data fields directly.
+      const content = `[callback] data=${data}${
+        originalMsgId ? ` original_message_id=${originalMsgId}` : ''
+      }`;
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.callbackQuery.id,
+        chat_jid: chatJid,
+        sender,
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+        callback_data: data,
+        callback_message_id: originalMsgId,
+      });
+
+      logger.info(
+        { chatJid, sender: senderName, data, originalMsgId },
+        'Telegram callback_query delivered',
+      );
+    });
+
     // Handle errors gracefully
     this.bot.catch((err) => {
       logger.error({ err: err.message }, 'Telegram bot error');
@@ -403,7 +490,12 @@ export class TelegramChannel implements Channel {
   }
 
   ownsJid(jid: string): boolean {
-    return jid.startsWith('tg:');
+    if (!jid.startsWith('tg:')) return false;
+    // A chat this bot has seen inbound is definitively ours.
+    if (this.knownChats.has(jid)) return true;
+    // Legacy/fallback instance catches any tg: JID we haven't yet seen.
+    // Non-fallback instances (new bots) strictly own only what they've observed.
+    return this.isFallback;
   }
 
   async disconnect(): Promise<void> {
@@ -423,15 +515,127 @@ export class TelegramChannel implements Channel {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }
   }
+
+  /**
+   * Send a message with an inline keyboard. Returns the message_id so callers
+   * can later edit/remove the keyboard with editMessage().
+   * Falls back to plain text + keyboard if Markdown parsing fails.
+   */
+  async sendMessageWithKeyboard(
+    jid: string,
+    text: string,
+    keyboard: InlineKeyboard,
+  ): Promise<{ messageId: string }> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const numericId = jid.replace(/^tg:/, '');
+    const replyMarkup = { inline_keyboard: keyboard };
+    let result;
+    try {
+      result = await this.bot.api.sendMessage(numericId, text, {
+        parse_mode: 'Markdown',
+        reply_markup: replyMarkup,
+      });
+    } catch (err) {
+      logger.debug({ err }, 'Markdown keyboard send failed, retrying as plain text');
+      result = await this.bot.api.sendMessage(numericId, text, {
+        reply_markup: replyMarkup,
+      });
+    }
+    logger.info(
+      { jid, messageId: result.message_id, buttons: keyboard.flat().length },
+      'Telegram keyboard message sent',
+    );
+    return { messageId: result.message_id.toString() };
+  }
+
+  /**
+   * Delete a message by id. Silent on the usual 48h window / already-gone errors.
+   */
+  async deleteMessage(jid: string, messageId: string): Promise<void> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const numericId = jid.replace(/^tg:/, '');
+    const msgIdNum = parseInt(messageId, 10);
+    try {
+      await this.bot.api.deleteMessage(numericId, msgIdNum);
+      logger.info({ jid, messageId }, 'Telegram message deleted');
+    } catch (err: any) {
+      // 400 "message to delete not found" / 400 "message can't be deleted" etc.
+      // These are non-fatal — log at debug level and move on.
+      logger.debug(
+        { jid, messageId, err: err?.message || String(err) },
+        'Telegram deleteMessage failed (non-fatal — likely older than 48h or already gone)',
+      );
+    }
+  }
+
+  /**
+   * Edit an existing message — text, keyboard, or both.
+   * keyboard === null  -> remove keyboard
+   * keyboard === undefined -> leave keyboard unchanged (text-only edit)
+   * keyboard array -> replace keyboard
+   */
+  async editMessage(
+    jid: string,
+    messageId: string,
+    text: string,
+    keyboard?: InlineKeyboard | null,
+  ): Promise<void> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const numericId = jid.replace(/^tg:/, '');
+    const msgIdNum = parseInt(messageId, 10);
+    const opts: any = { parse_mode: 'Markdown' };
+    if (keyboard === null) {
+      opts.reply_markup = { inline_keyboard: [] };
+    } else if (keyboard !== undefined) {
+      opts.reply_markup = { inline_keyboard: keyboard };
+    }
+    try {
+      await this.bot.api.editMessageText(numericId, msgIdNum, text, opts);
+    } catch (err) {
+      // Fallback: retry without Markdown
+      logger.debug({ err }, 'Markdown editMessage failed, retrying plain');
+      delete opts.parse_mode;
+      await this.bot.api.editMessageText(numericId, msgIdNum, text, opts);
+    }
+    logger.info({ jid, messageId, length: text.length }, 'Telegram message edited');
+  }
 }
 
-registerChannel('telegram', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['TELEGRAM_BOT_TOKEN']);
+// CapYear bot — registered FIRST so router.findChannel() matches it before
+// the fallback MicroRekon channel for chats this bot has seen.
+registerChannel('telegram-capyear', (opts: ChannelOpts) => {
+  const envVars = readEnvFile(['TELEGRAM_BOT_TOKEN_CAPYEAR']);
   const token =
-    process.env.TELEGRAM_BOT_TOKEN || envVars.TELEGRAM_BOT_TOKEN || '';
+    process.env.TELEGRAM_BOT_TOKEN_CAPYEAR ||
+    envVars.TELEGRAM_BOT_TOKEN_CAPYEAR ||
+    '';
   if (!token) {
-    logger.warn('Telegram: TELEGRAM_BOT_TOKEN not set');
+    logger.debug('Telegram: TELEGRAM_BOT_TOKEN_CAPYEAR not set — skipping CapYear bot');
     return null;
   }
-  return new TelegramChannel(token, opts);
+  return new TelegramChannel(token, opts, 'telegram-capyear', /*isFallback*/ false);
+});
+
+// MicroRekon bot — the legacy / primary assistant. Registered SECOND, marked
+// as fallback so it keeps ownership of any pre-existing chat that hasn't yet
+// been claimed by a newer bot instance (e.g. right after restart).
+// Backward-compat: falls back to TELEGRAM_BOT_TOKEN if _MICROREKON is unset.
+registerChannel('telegram-microrekon', (opts: ChannelOpts) => {
+  const envVars = readEnvFile([
+    'TELEGRAM_BOT_TOKEN_MICROREKON',
+    'TELEGRAM_BOT_TOKEN',
+  ]);
+  const token =
+    process.env.TELEGRAM_BOT_TOKEN_MICROREKON ||
+    envVars.TELEGRAM_BOT_TOKEN_MICROREKON ||
+    process.env.TELEGRAM_BOT_TOKEN ||
+    envVars.TELEGRAM_BOT_TOKEN ||
+    '';
+  if (!token) {
+    logger.warn(
+      'Telegram: neither TELEGRAM_BOT_TOKEN_MICROREKON nor TELEGRAM_BOT_TOKEN set',
+    );
+    return null;
+  }
+  return new TelegramChannel(token, opts, 'telegram-microrekon', /*isFallback*/ true);
 });

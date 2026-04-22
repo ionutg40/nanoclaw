@@ -24,7 +24,29 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    python3 \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# Dedicated Python venv for micromanagement calendar scripts.
+# Kept isolated from system python so deps don't collide with other tooling.
+RUN python3 -m venv /opt/calendar-venv && \
+    /opt/calendar-venv/bin/pip install --no-cache-dir \
+      google-api-python-client \
+      google-auth-httplib2 \
+      google-auth-oauthlib
+
+# Dedicated Python venv for CapYear grade-verifier (capyear_grades group).
+# Reuses the system Chromium installed below — Playwright respects the
+# PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH env var, so we skip the ~110MB
+# Playwright browser download.
+RUN python3 -m venv /opt/grade-verifier-venv && \
+    /opt/grade-verifier-venv/bin/pip install --no-cache-dir \
+      python-dotenv \
+      requests \
+      pandas \
+      playwright \
+      playwright-stealth
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium

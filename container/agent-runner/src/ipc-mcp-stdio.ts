@@ -68,6 +68,131 @@ server.tool(
 );
 
 server.tool(
+  'send_message_with_keyboard',
+  `Send a message with an inline keyboard (interactive buttons). Only works on Telegram. Each button has a \`text\` label and a \`callback_data\` string (max 64 bytes) that comes back as a message to you when the user taps.
+
+Keyboard shape: \`[[ {text, callback_data}, {text, callback_data} ], [ {text, callback_data} ]]\` — outer array is rows, inner is buttons per row.
+
+KEEP callback_data SHORT AND OPAQUE. Recommended: \`<action>:<short_id>\` e.g. \`a:7f3a\`, \`c:4e2b\`. Map the short id to the full state (submission record etc.) in your own store — not in the button.
+
+When the user taps a button, you receive a message with \`[callback] data=<value>\` in the text. Edit or remove the keyboard with edit_message once you've acted so the user can't double-tap.`,
+  {
+    text: z.string().describe('The message text to send'),
+    keyboard: z
+      .array(
+        z.array(
+          z.object({
+            text: z.string().describe('Button label shown to the user'),
+            callback_data: z
+              .string()
+              .max(64)
+              .describe(
+                'Opaque payload (≤64 bytes) returned when the user taps',
+              ),
+          }),
+        ),
+      )
+      .describe('2D array: rows of button objects'),
+  },
+  async (args) => {
+    const correlationId = `k-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    const data = {
+      type: 'message_with_keyboard',
+      chatJid,
+      text: args.text,
+      keyboard: args.keyboard,
+      correlation_id: correlationId,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Keyboard message queued (correlation_id=${correlationId}). The message_id will be delivered via /workspace/ipc/acks/.`,
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
+  'delete_message',
+  `Delete a message you sent earlier (Telegram only, 48h window). Use to remove decision prompts with PII after the operator has acted on them — keeps the chat clean and minimizes how long student names/scores sit in Telegram's cloud.
+
+Fails silently if the message is >48h old or already deleted. If you're past the 48h window and really need the message gone, edit_message it to something minimal instead.`,
+  {
+    messageId: z
+      .string()
+      .describe('Platform message id (Telegram message_id as string).'),
+  },
+  async (args) => {
+    const data = {
+      type: 'delete_message',
+      chatJid,
+      messageId: args.messageId,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(MESSAGES_DIR, data);
+    return {
+      content: [{ type: 'text' as const, text: 'Delete queued.' }],
+    };
+  },
+);
+
+server.tool(
+  'edit_message',
+  `Edit a message you sent earlier. Use to: (a) update text (e.g. progress "3/14 done"), (b) remove the keyboard after action (pass keyboard=null), (c) replace the keyboard with a new one.
+
+You need the messageId from when the message was sent. For plain send_message there is no messageId available — use this tool only for messages sent via send_message_with_keyboard.`,
+  {
+    messageId: z
+      .string()
+      .describe(
+        'Platform message id (Telegram message_id as string). Available after send_message_with_keyboard completes.',
+      ),
+    text: z.string().describe('The new text to replace the current message with'),
+    keyboard: z
+      .union([
+        z.array(
+          z.array(
+            z.object({
+              text: z.string(),
+              callback_data: z.string().max(64),
+            }),
+          ),
+        ),
+        z.null(),
+      ])
+      .optional()
+      .describe(
+        'null to remove the keyboard, an array to replace it, or omit to leave the keyboard unchanged',
+      ),
+  },
+  async (args) => {
+    const data = {
+      type: 'edit_message',
+      chatJid,
+      messageId: args.messageId,
+      text: args.text,
+      keyboard: args.keyboard === undefined ? undefined : args.keyboard,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: 'Edit queued.' }],
+    };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools. Returns the task ID for future reference. To modify an existing task, use update_task instead.
 

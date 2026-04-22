@@ -30,6 +30,13 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  // Extra env vars passed to the container (e.g. {"ANTHROPIC_MODEL": "claude-haiku-4-5-20251001"}).
+  // Useful for per-group model selection or feature flags. NEVER put secrets here —
+  // they live in OneCLI gateway, not group config.
+  env?: Record<string, string>;
+  // If true, nanoclaw spawns an idle container for this group at boot so the
+  // first user message doesn't pay the cold-start tax.
+  preWarm?: boolean;
 }
 
 export interface RegisteredGroup {
@@ -55,7 +62,21 @@ export interface NewMessage {
   reply_to_message_id?: string;
   reply_to_message_content?: string;
   reply_to_sender_name?: string;
+  // Set when this message was synthesized from a Telegram callback_query
+  // (user tapped an inline-keyboard button). The agent can act on these.
+  callback_data?: string;
+  callback_message_id?: string;
 }
+
+// --- Inline keyboard primitives (used by Telegram; other channels may stub) ---
+
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
+}
+
+// 2D array: outer = rows, inner = buttons in that row.
+export type InlineKeyboard = InlineKeyboardButton[][];
 
 export interface ScheduledTask {
   id: string;
@@ -95,6 +116,24 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: send a message with an inline keyboard. Returns the platform's
+  // message id so the caller can edit/remove the keyboard later.
+  sendMessageWithKeyboard?(
+    jid: string,
+    text: string,
+    keyboard: InlineKeyboard,
+  ): Promise<{ messageId: string }>;
+  // Optional: edit an existing message. Pass keyboard=null to remove buttons,
+  // undefined to leave keyboard unchanged.
+  editMessage?(
+    jid: string,
+    messageId: string,
+    text: string,
+    keyboard?: InlineKeyboard | null,
+  ): Promise<void>;
+  // Optional: delete a message. Telegram has a 48h window — implementations
+  // should resolve without throwing when the message is too old or missing.
+  deleteMessage?(jid: string, messageId: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages
