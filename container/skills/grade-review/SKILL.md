@@ -58,7 +58,7 @@ bot_cli.py process-backlog --confidence-min 0.99 [--limit N] [--dry-run]
 bot_cli.py health
 ```
 
-All CLI output is JSON. Container env already includes `NOCODB_URL=http://host.docker.internal:8082`.
+All CLI output is JSON. Audit rows append to `data/audit/audit.jsonl` inside the mounted grade-verifier directory — no external service involved.
 
 ## Error codes (map to user English)
 
@@ -71,7 +71,7 @@ All CLI output is JSON. Container env already includes `NOCODB_URL=http://host.d
 | `LW_DOM_CHANGED` | "LearnWorlds layout changed — fasty needs to re-run the probe." |
 | `LW_UNKNOWN_SUBMISSION` | "Submission not found in LearnWorlds." |
 | `NHA_CSV_MISSING` | "NHA CSV missing. Drop a fresh export and try again." |
-| `NOCODB_WRITE_FAILED` | "Saved in LW but couldn't write the audit row — flag fasty." |
+| `AUDIT_WRITE_FAILED` | "Saved in LW but couldn't write the audit log — flag fasty." |
 | `NOT_IMPLEMENTED` | "Submit isn't wired up yet (selector probe pending)." |
 
 NEVER hide a partial failure — surface failed submission IDs inline.
