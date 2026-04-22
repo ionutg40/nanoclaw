@@ -37,6 +37,11 @@ export interface ContainerConfig {
   // If true, nanoclaw spawns an idle container for this group at boot so the
   // first user message doesn't pay the cold-start tax.
   preWarm?: boolean;
+  // If true, every user message starts a fresh SDK session — no resume.
+  // Use for groups where stale conversational context (across days/weeks)
+  // does more harm than good (e.g. tool-use loops where the agent shouldn't
+  // remember last-week's state). Trade-off: agent loses cross-session memory.
+  freshSessionEachTurn?: boolean;
 }
 
 export interface RegisteredGroup {

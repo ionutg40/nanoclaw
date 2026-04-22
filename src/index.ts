@@ -343,7 +343,12 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  // Per-group opt-out: groups marked freshSessionEachTurn always start a new
+  // SDK session (no resume). Prevents stale conversational context from
+  // bleeding across /review invocations.
+  const sessionId = group.containerConfig?.freshSessionEachTurn
+    ? undefined
+    : sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -755,9 +760,7 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       if (!channel.editMessage) {
-        throw new Error(
-          `Channel ${channel.name} does not support editMessage`,
-        );
+        throw new Error(`Channel ${channel.name} does not support editMessage`);
       }
       return channel.editMessage(jid, messageId, text, keyboard);
     },

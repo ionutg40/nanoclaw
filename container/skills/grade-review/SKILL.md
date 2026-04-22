@@ -8,16 +8,34 @@ allowed-tools: Bash, Read, Write
 
 Trigger: `/review`, "check grades", "process pending", "verify scores", "let's review". For ambiguous chat, do NOT invoke — reply naturally.
 
+## Receiving a fresh NHA CSV (Telegram attachment)
+
+When the user (Monica) sends a CSV file in the chat, the channel stores it
+at `/workspace/group/attachments/<filename>.csv` and you receive a message
+that looks like `[Document: <name>.csv] (/workspace/group/attachments/<name>.csv)`.
+
+Action:
+1. Acknowledge: "Got the new NHA CSV. I'll use it on the next /review."
+2. Save the path to `/workspace/group/active_nha_csv.txt` (one-line file with
+   the absolute path). Use Write tool.
+3. On every subsequent `/review`, read that file first; if present and the
+   path still exists, pass `--nha <path>` to `bot_cli.py fetch-pending`
+   (with `--force` to skip cache).
+4. If user sends a NEW CSV later, overwrite the file with the new path.
+
+If `/workspace/group/active_nha_csv.txt` is missing or points to a deleted
+file, fall back to the default CSV (no `--nha` flag).
+
 ## Three-step flow on `/review`
 
 1. **Acknowledge** with `mcp__nanoclaw__send_message` text=`"Fetching pending submissions..."` (LW scrape can take 30-90s on the first cold call).
 
-2. **Run** the CLI and parse JSON:
+2. **Run** the CLI and parse JSON. If `/workspace/group/active_nha_csv.txt` exists, append `--nha <its-content>`:
    ```bash
    /opt/grade-verifier-venv/bin/python \
-     /workspace/extra/grade-verifier/src/bot_cli.py fetch-pending
+     /workspace/extra/grade-verifier/src/bot_cli.py fetch-pending [--nha /workspace/group/attachments/<file>.csv] [--force]
    ```
-   The output ALREADY includes a `render` block with `summary_md`, `keyboard`, and `session_state` — pre-formatted by Python so you don't need to format anything yourself.
+   The output ALREADY includes a `render` block with `summary_md`, `keyboard`, and `session_state` — pre-formatted by Python so you don't need to format anything yourself. If the render includes `nha_warning`, prepend it to the message before the summary.
 
 3. **Send** with `mcp__nanoclaw__send_message_with_keyboard(text=render.summary_md, keyboard=render.keyboard)` and **save** `render.session_state` to `/workspace/group/session_state.json`.
 

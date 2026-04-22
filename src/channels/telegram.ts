@@ -58,16 +58,22 @@ export class TelegramChannel implements Channel {
   // by THIS instance. Used by ownsJid for outbound routing.
   private knownChats: Set<string> = new Set();
 
+  // Per-bot identity used in /ping replies and possibly other surface text.
+  // Defaults to the global ASSISTANT_NAME so existing bots keep their behavior.
+  private assistantLabel: string;
+
   constructor(
     botToken: string,
     opts: TelegramChannelOpts,
     channelName: string = 'telegram',
     isFallback: boolean = true,
+    assistantLabel?: string,
   ) {
     this.botToken = botToken;
     this.name = channelName;
     this.opts = opts;
     this.isFallback = isFallback;
+    this.assistantLabel = assistantLabel || ASSISTANT_NAME;
   }
 
   /**
@@ -103,7 +109,10 @@ export class TelegramChannel implements Channel {
       const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
       const resp = await fetch(fileUrl);
       if (!resp.ok) {
-        logger.warn({ fileId, status: resp.status }, 'Telegram file download failed');
+        logger.warn(
+          { fileId, status: resp.status },
+          'Telegram file download failed',
+        );
         return null;
       }
 
@@ -144,7 +153,7 @@ export class TelegramChannel implements Channel {
     // Command to check bot status
     this.bot.command('ping', (ctx) => {
       this.knownChats.add(`tg:${ctx.chat.id}`);
-      ctx.reply(`${ASSISTANT_NAME} is online (${this.name}).`);
+      ctx.reply(`${this.assistantLabel} is online (${this.name}).`);
     });
 
     // Telegram bot commands handled above — skip them in the general handler
@@ -390,12 +399,21 @@ export class TelegramChannel implements Channel {
         chat.type === 'private' ? senderName : (chat as any).title || chatJid;
       const isGroup = chat.type === 'group' || chat.type === 'supergroup';
 
-      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'telegram', isGroup);
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        chatName,
+        'telegram',
+        isGroup,
+      );
 
       // Only deliver to registered groups — same gate as text messages.
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) {
-        logger.debug({ chatJid, data }, 'Callback from unregistered chat, dropping');
+        logger.debug(
+          { chatJid, data },
+          'Callback from unregistered chat, dropping',
+        );
         return;
       }
 
@@ -536,7 +554,10 @@ export class TelegramChannel implements Channel {
         reply_markup: replyMarkup,
       });
     } catch (err) {
-      logger.debug({ err }, 'Markdown keyboard send failed, retrying as plain text');
+      logger.debug(
+        { err },
+        'Markdown keyboard send failed, retrying as plain text',
+      );
       result = await this.bot.api.sendMessage(numericId, text, {
         reply_markup: replyMarkup,
       });
@@ -597,23 +618,41 @@ export class TelegramChannel implements Channel {
       delete opts.parse_mode;
       await this.bot.api.editMessageText(numericId, msgIdNum, text, opts);
     }
-    logger.info({ jid, messageId, length: text.length }, 'Telegram message edited');
+    logger.info(
+      { jid, messageId, length: text.length },
+      'Telegram message edited',
+    );
   }
 }
 
 // CapYear bot — registered FIRST so router.findChannel() matches it before
 // the fallback MicroRekon channel for chats this bot has seen.
 registerChannel('telegram-capyear', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['TELEGRAM_BOT_TOKEN_CAPYEAR']);
+  const envVars = readEnvFile([
+    'TELEGRAM_BOT_TOKEN_CAPYEAR',
+    'ASSISTANT_NAME_CAPYEAR',
+  ]);
   const token =
     process.env.TELEGRAM_BOT_TOKEN_CAPYEAR ||
     envVars.TELEGRAM_BOT_TOKEN_CAPYEAR ||
     '';
   if (!token) {
-    logger.debug('Telegram: TELEGRAM_BOT_TOKEN_CAPYEAR not set — skipping CapYear bot');
+    logger.debug(
+      'Telegram: TELEGRAM_BOT_TOKEN_CAPYEAR not set — skipping CapYear bot',
+    );
     return null;
   }
-  return new TelegramChannel(token, opts, 'telegram-capyear', /*isFallback*/ false);
+  const label =
+    process.env.ASSISTANT_NAME_CAPYEAR ||
+    envVars.ASSISTANT_NAME_CAPYEAR ||
+    undefined;
+  return new TelegramChannel(
+    token,
+    opts,
+    'telegram-capyear',
+    /*isFallback*/ false,
+    label,
+  );
 });
 
 // MicroRekon bot — the legacy / primary assistant. Registered SECOND, marked
@@ -637,5 +676,10 @@ registerChannel('telegram-microrekon', (opts: ChannelOpts) => {
     );
     return null;
   }
-  return new TelegramChannel(token, opts, 'telegram-microrekon', /*isFallback*/ true);
+  return new TelegramChannel(
+    token,
+    opts,
+    'telegram-microrekon',
+    /*isFallback*/ true,
+  );
 });
