@@ -89,8 +89,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
               const targetGroup = registeredGroups[data.chatJid];
               const isAuthorized =
                 !!data.chatJid &&
-                (isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup));
+                (isMain || (targetGroup && targetGroup.folder === sourceGroup));
 
               if (data.type === 'message' && data.chatJid && data.text) {
                 if (isAuthorized) {
@@ -136,11 +135,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     'IPC keyboard message sent',
                   );
                   // Write ack so agent can correlate message_id for future edits.
-                  const ackDir = path.join(
-                    ipcBaseDir,
-                    sourceGroup,
-                    'acks',
-                  );
+                  const ackDir = path.join(ipcBaseDir, sourceGroup, 'acks');
                   fs.mkdirSync(ackDir, { recursive: true });
                   fs.writeFileSync(
                     path.join(ackDir, `${file}.ack`),
@@ -199,8 +194,8 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     data.keyboard === null
                       ? null
                       : Array.isArray(data.keyboard)
-                      ? (data.keyboard as InlineKeyboard)
-                      : undefined;
+                        ? (data.keyboard as InlineKeyboard)
+                        : undefined;
                   await deps.editMessage(
                     data.chatJid,
                     data.messageId,
