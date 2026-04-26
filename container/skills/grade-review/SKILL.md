@@ -50,7 +50,7 @@ Load `session_state.json`, then route per `${CLAUDE_SKILL_DIR}/callback_routing.
 | `b:<group>:<token>` | For each `short_id` in `groups[token].short_ids`: run `bot_cli.py submit --id <full_id> --action <approve\|correct\|bounce> [--nha-score N]`. Then `edit_message` to status + `keyboard: null`. Show progress edits every 5+ submissions. |
 | `r:<group>:<token>` | Render the first individual card from that group (template in `formatters.md`). |
 | `a:<sid>` / `c:<sid>` / `x:<sid>` | Single submit, then `edit_message` to status. |
-| `s:<sid>` | Skip — just edit message to "_Skipped_", `keyboard: null`. No CLI call. |
+| `s:<sid>` | Skip — run `bot_cli.py submit --id <full_id> --action skip` (writes audit row, no LW call). Then `edit_message` to "_Skipped_", `keyboard: null`. |
 | `d:<sid>` | Show full details (PII allowed only here). Add `[← Back]` button → `back:<sid>`. |
 | `back:<sid>` / `back:summary` | Restore the previous view. |
 | `end` | Send session-close summary and clear `session_state.json`. |
@@ -64,9 +64,10 @@ For exact message templates and PII-minimization rules, see `${CLAUDE_SKILL_DIR}
 bot_cli.py fetch-pending          # add --force to skip cache
 
 # Single-submission action
-bot_cli.py submit --id <full_id> --action approve|correct|bounce \
+bot_cli.py submit --id <full_id> --action approve|correct|bounce|skip \
                   [--nha-score N]   # required for action=correct
                   [--actor monica]
+# `skip` writes an audit row but doesn't touch LW — for "deferred" deciding
 
 # SUPERVISORY — ONLY when Monica explicitly says "process the backlog" or similar
 bot_cli.py process-backlog --confidence-min 0.99 [--limit N] [--dry-run]
