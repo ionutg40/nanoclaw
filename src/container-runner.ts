@@ -3,6 +3,7 @@
  * Spawns agent execution in containers and handles IPC
  */
 import { ChildProcess, spawn } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -316,7 +317,12 @@ export async function runContainerAgent(
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
+  // Date.now() alone collides if the scheduler dispatches two tasks for the
+  // same group within the same millisecond (cron tick fan-out, retry-after-
+  // crash). docker run --name is unique per host, so a collision fails the
+  // second spawn outright. crypto.randomBytes(4) gives 4B values per ms slot
+  // so the practical collision rate is zero.
+  const containerName = `nanoclaw-${safeName}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   // Main group uses the default OneCLI agent; others use their own agent.
   const agentIdentifier = input.isMain
     ? undefined

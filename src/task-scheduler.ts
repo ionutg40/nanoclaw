@@ -34,10 +34,23 @@ export function computeNextRun(task: ScheduledTask): string | null {
   const now = Date.now();
 
   if (task.schedule_type === 'cron') {
-    const interval = CronExpressionParser.parse(task.schedule_value, {
-      tz: TIMEZONE,
-    });
-    return interval.next().toISOString();
+    // CronExpressionParser.parse throws on malformed input. ipc.ts validates
+    // at create-time, but the DB can carry rows from older code paths or a
+    // direct schedule_task IPC with a typoed value. Without this guard, the
+    // scheduler poll crashes mid-tick and the task gets retried forever
+    // because nextRun never advances.
+    try {
+      const interval = CronExpressionParser.parse(task.schedule_value, {
+        tz: TIMEZONE,
+      });
+      return interval.next().toISOString();
+    } catch (err) {
+      logger.warn(
+        { taskId: task.id, value: task.schedule_value, err: String(err) },
+        'Invalid cron expression — task will be skipped this tick',
+      );
+      return null;
+    }
   }
 
   if (task.schedule_type === 'interval') {

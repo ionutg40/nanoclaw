@@ -34,6 +34,10 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+  // Process-wide monotonic counter for IPC input filenames. Combined with
+  // Date.now() and a 6-char random suffix, makes collisions effectively
+  // impossible even under burst writes from multiple groups.
+  private static sendSeq = 0;
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -166,12 +170,28 @@ export class GroupQueue {
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
+      // 6 random chars (~2.2B outcomes) + ms timestamp + monotonic counter
+      // makes collisions effectively impossible even under burst writes;
+      // 4 chars (~1.6M outcomes) hit ~50% collision at ~1300 writes/ms,
+      // which a follow-up message + closeStdin pair could approach. Matches
+      // the agent-side ipc-mcp-stdio.ts convention.
+      const filename = `${Date.now()}-${(GroupQueue.sendSeq++).toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`;
       const filepath = path.join(inputDir, filename);
-      const tempPath = `${filepath}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text }));
-      fs.renameSync(tempPath, filepath);
-      return true;
+      const tempPath = `${filepath}.tmp-${process.pid}`;
+      try {
+        fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text }));
+        fs.renameSync(tempPath, filepath);
+        return true;
+      } catch (writeErr) {
+        // Best-effort cleanup of the orphaned tmp file so the inputDir
+        // doesn't accumulate unreferenced *.tmp-<pid> entries over time.
+        try {
+          fs.unlinkSync(tempPath);
+        } catch {
+          /* ignore */
+        }
+        throw writeErr;
+      }
     } catch {
       return false;
     }
@@ -179,6 +199,11 @@ export class GroupQueue {
 
   /**
    * Signal the active container to wind down by writing a close sentinel.
+   *
+   * `_close` is an empty zero-byte file used purely as a sentinel
+   * (container only checks existence and unlinks). writeFileSync of empty
+   * content is an atomic create — there's no partial-state window for the
+   * reader to observe, so tmp+rename would only add complexity here.
    */
   closeStdin(groupJid: string): void {
     const state = this.getGroup(groupJid);

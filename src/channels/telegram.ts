@@ -125,7 +125,26 @@ export class TelegramChannel implements Channel {
       }
 
       const buffer = Buffer.from(await resp.arrayBuffer());
-      fs.writeFileSync(destPath, buffer);
+      // 'wx' flag (O_CREAT|O_EXCL|O_WRONLY) refuses to overwrite an existing
+      // entry at destPath — including a pre-staged symlink, which would
+      // otherwise be silently followed to whatever target the attacker chose
+      // (an agent inside the container can write into the mounted attachments
+      // dir; without this guard, a symlink there steers our host write to an
+      // arbitrary path the orchestrator can reach). Mirrors the Slack
+      // file_shared defense.
+      try {
+        fs.writeFileSync(destPath, buffer, { flag: 'wx', mode: 0o600 });
+      } catch (writeErr) {
+        const code = (writeErr as { code?: string })?.code;
+        if (code === 'EEXIST' || code === 'ELOOP') {
+          logger.warn(
+            { fileId, code },
+            'Telegram file download skipped: destination exists or is a symlink',
+          );
+          return null;
+        }
+        throw writeErr;
+      }
 
       logger.info({ fileId, dest: destPath }, 'Telegram file downloaded');
       return `/workspace/group/attachments/${finalName}`;

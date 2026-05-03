@@ -79,9 +79,16 @@ export function startIpcWatcher(deps: IpcDeps): void {
       // Process messages from this group's IPC directory
       try {
         if (fs.existsSync(messagesDir)) {
+          // Sort for stable order: filenames are `${Date.now()}-${rand}.json`,
+          // so lexicographic sort matches send order. readdirSync returns
+          // filesystem dirent order (not sorted on ext4) — without this, an
+          // edit_message can be processed before the corresponding
+          // send_message_with_keyboard if both arrive within the same poll
+          // tick, ack'd against the wrong message id.
           const messageFiles = fs
             .readdirSync(messagesDir)
-            .filter((f) => f.endsWith('.json'));
+            .filter((f) => f.endsWith('.json'))
+            .sort();
           for (const file of messageFiles) {
             const filePath = path.join(messagesDir, file);
             try {
@@ -212,7 +219,17 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   );
                 }
               }
-              fs.unlinkSync(filePath);
+              // Tolerate ENOENT here: another reader (or manual cleanup)
+              // may have already removed the file. Without this, the
+              // throw cascades out of the for-loop and skips remaining
+              // files in this tick; they'll be processed next tick, but
+              // it's noisier and slower than necessary.
+              try {
+                fs.unlinkSync(filePath);
+              } catch (unlinkErr) {
+                if ((unlinkErr as { code?: string })?.code !== 'ENOENT')
+                  throw unlinkErr;
+              }
             } catch (err) {
               logger.error(
                 { file, sourceGroup, err },
@@ -220,10 +237,17 @@ export function startIpcWatcher(deps: IpcDeps): void {
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
+              try {
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch (renameErr) {
+                // ENOENT here means the file was already cleaned up by
+                // another process; nothing left to quarantine.
+                if ((renameErr as { code?: string })?.code !== 'ENOENT')
+                  throw renameErr;
+              }
             }
           }
         }
@@ -239,14 +263,20 @@ export function startIpcWatcher(deps: IpcDeps): void {
         if (fs.existsSync(tasksDir)) {
           const taskFiles = fs
             .readdirSync(tasksDir)
-            .filter((f) => f.endsWith('.json'));
+            .filter((f) => f.endsWith('.json'))
+            .sort();
           for (const file of taskFiles) {
             const filePath = path.join(tasksDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               // Pass source group identity to processTaskIpc for authorization
               await processTaskIpc(data, sourceGroup, isMain, deps);
-              fs.unlinkSync(filePath);
+              try {
+                fs.unlinkSync(filePath);
+              } catch (unlinkErr) {
+                if ((unlinkErr as { code?: string })?.code !== 'ENOENT')
+                  throw unlinkErr;
+              }
             } catch (err) {
               logger.error(
                 { file, sourceGroup, err },
@@ -254,10 +284,15 @@ export function startIpcWatcher(deps: IpcDeps): void {
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
+              try {
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch (renameErr) {
+                if ((renameErr as { code?: string })?.code !== 'ENOENT')
+                  throw renameErr;
+              }
             }
           }
         }

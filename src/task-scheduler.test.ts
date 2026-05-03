@@ -126,4 +126,28 @@ describe('task scheduler', () => {
       (new Date(nextRun!).getTime() - new Date(scheduledTime).getTime()) % ms;
     expect(offset).toBe(0);
   });
+
+  it('computeNextRun returns null for malformed cron without throwing', () => {
+    // ipc.ts validates at create-time, but a typoed value can still land in
+    // the DB via direct schedule_task IPC, agent SDK skill, or older code.
+    // Without the try/catch around CronExpressionParser.parse, this would
+    // crash the scheduler poll mid-tick.
+    const task = {
+      id: 'bad-cron',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'test',
+      schedule_type: 'cron' as const,
+      schedule_value: 'this is not a cron expression',
+      context_mode: 'isolated' as const,
+      next_run: new Date().toISOString(),
+      last_run: null,
+      last_result: null,
+      status: 'active' as const,
+      created_at: '2026-01-01T00:00:00.000Z',
+    };
+
+    expect(() => computeNextRun(task)).not.toThrow();
+    expect(computeNextRun(task)).toBeNull();
+  });
 });

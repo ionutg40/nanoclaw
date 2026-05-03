@@ -768,6 +768,40 @@ describe('TelegramChannel', () => {
       );
     });
 
+    it('refuses to overwrite existing/symlinked destination (EEXIST)', async () => {
+      // Simulates a pre-staged symlink at attachments/report.pdf -> /etc/passwd.
+      // The 'wx' flag causes writeFileSync to throw EEXIST; channel must NOT
+      // emit the path marker (would've made the agent process attacker content).
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getFile.mockResolvedValueOnce({
+        file_path: 'documents/file_0.pdf',
+      });
+      const eexist = Object.assign(new Error('exists'), { code: 'EEXIST' });
+      vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => {
+        throw eexist;
+      });
+
+      const ctx = createMediaCtx({
+        extra: { document: { file_name: 'report.pdf', file_id: 'doc_id' } },
+      });
+      await triggerMediaMessage('message:document', ctx);
+      await flushPromises();
+
+      // Falls back to a marker without path so the agent still sees the event
+      // but won't read whatever was at the symlink target.
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          content: expect.stringContaining('[Document: report.pdf]'),
+        }),
+      );
+      const call = (opts.onMessage as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(call[1].content).not.toContain('/workspace/group/attachments');
+    });
+
     it('downloads video', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
