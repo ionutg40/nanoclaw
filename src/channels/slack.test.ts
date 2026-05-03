@@ -1140,10 +1140,7 @@ describe('SlackChannel', () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
       await channel.connect();
-      await channel.sendMessage(
-        'slack:C0123456789',
-        'Note: _do not_ skip',
-      );
+      await channel.sendMessage('slack:C0123456789', 'Note: _do not_ skip');
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
       expect(call.text).toBe('Note: _do not_ skip');
     });
@@ -1288,6 +1285,70 @@ describe('SlackChannel', () => {
       await channel.sendMessage('slack:C0123456789', '');
       // No crash; postMessage was called (with empty text)
       expect(currentApp().client.chat.postMessage).toHaveBeenCalled();
+    });
+
+    it('truncates button text > 75 chars with ellipsis', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      const longLabel = 'X'.repeat(100);
+      await channel.sendMessageWithKeyboard(
+        'slack:C0123456789',
+        'Pick:',
+        [[{ text: longLabel, callback_data: 'a' }]],
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      const btnText = call.blocks[1].elements[0].text.text;
+      expect(btnText.length).toBeLessThanOrEqual(75);
+      expect(btnText.endsWith('…')).toBe(true);
+    });
+
+    it('truncates action_id > 255 chars', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      const longCallback = 'a:' + 'x'.repeat(300);
+      await channel.sendMessageWithKeyboard(
+        'slack:C0123456789',
+        'Pick:',
+        [[{ text: 'OK', callback_data: longCallback }]],
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      const actionId = call.blocks[1].elements[0].action_id;
+      expect(actionId.length).toBeLessThanOrEqual(255);
+    });
+
+    it('caps total blocks at 50 (drops extra keyboard rows)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      const keyboard = Array.from({ length: 60 }, (_, i) => [
+        { text: `Btn${i}`, callback_data: `a:${i}` },
+      ]);
+      await channel.sendMessageWithKeyboard(
+        'slack:C0123456789',
+        'Header:',
+        keyboard,
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.blocks.length).toBeLessThanOrEqual(50);
+    });
+
+    it('caps elements per actions block at 25 (Slack hard limit)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      const row = Array.from({ length: 30 }, (_, i) => ({
+        text: `B${i}`,
+        callback_data: `a:${i}`,
+      }));
+      await channel.sendMessageWithKeyboard(
+        'slack:C0123456789',
+        'Pick:',
+        [row],
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.blocks[1].elements.length).toBe(25);
     });
 
     it('truncates section text over 3000 chars (Slack limit)', async () => {

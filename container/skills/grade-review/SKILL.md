@@ -1,7 +1,7 @@
 ---
 name: grade-review
 description: Process Monica's CapYear grade verification queue. Use whenever the user sends `/review`, says "review", asks to "check grades", "process pending", "verify scores", anything similar in the CapYear Grades group, OR sends a `[callback] data=...` message (which is how inline-button taps arrive — load session_state.json and act on the encoded action). Calls bot_cli.py to fetch pending decisions and presents them with inline keyboards (Telegram Bot API or Slack Block Kit).
-allowed-tools: Bash, Read, Write
+allowed-tools: Bash, Read, Write, Glob, mcp__nanoclaw__send_message, mcp__nanoclaw__send_message_with_keyboard, mcp__nanoclaw__edit_message, mcp__nanoclaw__delete_message
 ---
 
 # Grade Review (CapYear)
