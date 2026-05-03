@@ -2038,7 +2038,12 @@ describe('SlackChannel', () => {
       await channel.sendMessage('slack:C0123456789', 'msg-1');
       await channel.sendMessage('slack:C0123456789', 'msg-2');
 
-      // 1st post hits rate-limit; 2nd succeeds
+      // 1st post hits rate-limit; 2nd succeeds.
+      // retry_after=0.05 keeps the test fast (~50ms) while still exercising
+      // the "honor retry_after value" code path. The source defensively
+      // floors falsy values to 1s; using a positive value avoids triggering
+      // that branch and keeps the unit test focused on the parse-and-sleep
+      // behavior — not on the floor.
       let callCount = 0;
       currentApp().client.chat.postMessage.mockImplementation(() => {
         callCount++;
@@ -2046,7 +2051,7 @@ describe('SlackChannel', () => {
           return Promise.reject({
             data: {
               error: 'ratelimited',
-              response_metadata: { retry_after: 0 },
+              response_metadata: { retry_after: 0.05 },
             },
           });
         }
@@ -2054,8 +2059,10 @@ describe('SlackChannel', () => {
       });
 
       await channel.connect();
-      // Wait briefly for flush (it has 100ms throttle internally)
-      await new Promise((r) => setTimeout(r, 250));
+      // Wait long enough for retry_after sleep (~50ms) + throttle (~100ms)
+      // + scheduler overhead. 300ms is a safe margin without bloating the
+      // suite runtime.
+      await new Promise((r) => setTimeout(r, 300));
 
       // Both messages were eventually delivered (or in queue if still rate-limited)
       // Importantly: the queue isn't permanently broken
