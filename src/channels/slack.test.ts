@@ -1022,7 +1022,11 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
 
-      for (const code of ['channel_not_found', 'is_archived', 'not_in_channel']) {
+      for (const code of [
+        'channel_not_found',
+        'is_archived',
+        'not_in_channel',
+      ]) {
         currentApp().client.chat.update.mockRejectedValueOnce({
           data: { error: code },
         });
@@ -1113,9 +1117,96 @@ describe('SlackChannel', () => {
         [[{ text: 'OK', callback_data: 'ok' }]],
       );
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
-      expect(call.blocks[0].text.text).toBe(
-        'See <https://example.com|docs>',
+      expect(call.blocks[0].text.text).toBe('See <https://example.com|docs>');
+    });
+
+    it('translates *italic* (Telegram) to _italic_ (Slack)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage('slack:C0123456789', 'Note: *do not* skip');
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe('Note: _do not_ skip');
+    });
+
+    it('preserves bold AND italic distinct in same message', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '**bold** and *italic* together',
       );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe('*bold* and _italic_ together');
+    });
+
+    it('preserves URL containing balanced parens (Wikipedia)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'See [Slack docs](https://en.wikipedia.org/wiki/Slack_(software))',
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe(
+        'See <https://en.wikipedia.org/wiki/Slack_(software)|Slack docs>',
+      );
+    });
+
+    it('encodes pipes inside URLs to avoid Slack <url|label> collision', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '[ticket](https://x.io/q?a=1|2)',
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe('<https://x.io/q?a=1%7C2|ticket>');
+    });
+
+    it('does NOT translate markdown inside backtick code spans', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'Use `**bold**` to emphasize',
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe('Use `**bold**` to emphasize');
+    });
+
+    it('does NOT translate markdown inside triple-backtick fences', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'Example:\n```\nx = a**b**\nlink: [docs](https://x)\n```\n*italic* outside',
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toContain('x = a**b**');
+      expect(call.text).toContain('[docs](https://x)');
+      expect(call.text).toContain('_italic_ outside');
+    });
+
+    it('truncates section text over 3000 chars (Slack limit)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      const longText = 'x'.repeat(3500);
+      await channel.sendMessageWithKeyboard(
+        'slack:C0123456789',
+        longText,
+        [[{ text: 'OK', callback_data: 'ok' }]],
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      const sectionText = call.blocks[0].text.text;
+      expect(sectionText.length).toBeLessThanOrEqual(3000);
+      expect(sectionText).toContain('truncated');
     });
 
     it('applies translation in plain sendMessage too', async () => {
@@ -1146,8 +1237,7 @@ describe('SlackChannel', () => {
         user: { id: 'U_USER_456', username: 'alice' },
       };
       for (const { pattern, handler } of currentApp().actionHandlers) {
-        const re =
-          pattern instanceof RegExp ? pattern : new RegExp(pattern);
+        const re = pattern instanceof RegExp ? pattern : new RegExp(pattern);
         if (!re.test('a:7f3a')) continue;
         await handler({
           ack,
@@ -1195,9 +1285,11 @@ describe('SlackChannel', () => {
       }
 
       // Internal queue should not exceed MAX_QUEUE_SIZE
-      const internalQueue = (channel as unknown as {
-        outgoingQueue: { jid: string; text: string }[];
-      }).outgoingQueue;
+      const internalQueue = (
+        channel as unknown as {
+          outgoingQueue: { jid: string; text: string }[];
+        }
+      ).outgoingQueue;
       expect(internalQueue.length).toBeLessThanOrEqual(500);
       // Oldest dropped: message msg-0 should not be in queue anymore
       expect(internalQueue.find((m) => m.text === 'msg-0')).toBeUndefined();
