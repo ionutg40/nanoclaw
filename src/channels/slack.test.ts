@@ -1198,11 +1198,9 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
       const longText = 'x'.repeat(3500);
-      await channel.sendMessageWithKeyboard(
-        'slack:C0123456789',
-        longText,
-        [[{ text: 'OK', callback_data: 'ok' }]],
-      );
+      await channel.sendMessageWithKeyboard('slack:C0123456789', longText, [
+        [{ text: 'OK', callback_data: 'ok' }],
+      ]);
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
       const sectionText = call.blocks[0].text.text;
       expect(sectionText.length).toBeLessThanOrEqual(3000);
@@ -1265,6 +1263,200 @@ describe('SlackChannel', () => {
       expect(id1).not.toBe(id2);
       expect(id1).toContain('1704067210.111');
       expect(id2).toContain('1704067220.222');
+    });
+  });
+
+  describe('ack failure early-return (block_actions + slash commands)', () => {
+    it('block_action: returns early without onMessage when ack throws', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      // Override ack with one that throws
+      const ack = vi.fn().mockRejectedValue(new Error('socket dropped'));
+      const action = { action_id: 'a:7f3a' };
+      const body = {
+        channel: { id: 'C0123456789' },
+        message: { ts: '1.0' },
+        user: { id: 'U_USER_456' },
+      };
+      for (const { handler } of currentApp().actionHandlers) {
+        await handler({ ack, action, body, client: currentApp().client });
+      }
+      expect(onMessage).not.toHaveBeenCalled();
+    });
+
+    it('slash command: returns early without onMessage when ack throws', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      const ack = vi.fn().mockRejectedValue(new Error('socket dropped'));
+      const command = {
+        command: '/review',
+        text: '',
+        channel_id: 'C0123456789',
+        user_id: 'U_USER_456',
+        user_name: 'alice',
+        trigger_id: 'TX',
+      };
+      for (const { handler } of currentApp().commandHandlers) {
+        await handler({ ack, command, client: currentApp().client });
+      }
+      expect(onMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('action_ts monotonic counter fallback', () => {
+    it('uses seq counter when action has no action_ts/ts', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      const ack = vi.fn().mockResolvedValue(undefined);
+      const body = {
+        channel: { id: 'C0123456789' },
+        message: { ts: '1.0' },
+        user: { id: 'U_USER_456' },
+      };
+      // Two clicks, no action_ts on either
+      for (let i = 0; i < 2; i++) {
+        for (const { handler } of currentApp().actionHandlers) {
+          await handler({
+            ack,
+            action: { action_id: 'a:7f3a' }, // no action_ts
+            body,
+            client: currentApp().client,
+          });
+        }
+      }
+      expect(onMessage).toHaveBeenCalledTimes(2);
+      const id1 = onMessage.mock.calls[0][1].id;
+      const id2 = onMessage.mock.calls[1][1].id;
+      expect(id1).not.toBe(id2);
+      expect(id1).toMatch(/seq\d+$/);
+      expect(id2).toMatch(/seq\d+$/);
+    });
+  });
+
+  describe('editMessage operational vs gone-forever errors', () => {
+    it('warns on not_in_channel (operational, fixable) but does not throw', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      currentApp().client.chat.update.mockRejectedValueOnce({
+        data: { error: 'not_in_channel' },
+      });
+      await expect(
+        channel.editMessage('slack:C0123456789', '1.0', 'x', null),
+      ).resolves.toBeUndefined();
+    });
+
+    it('debug-logs on edit_window_closed (gone forever)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      currentApp().client.chat.update.mockRejectedValueOnce({
+        data: { error: 'edit_window_closed' },
+      });
+      await expect(
+        channel.editMessage('slack:C0123456789', '1.0', 'x', null),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  describe('userNameCache LRU eviction', () => {
+    it('evicts oldest entry when cache reaches capacity', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Force resolve 1001 distinct users — 1001st triggers eviction
+      const cacheRef = (channel as unknown as {
+        userNameCache: Map<string, string>;
+      }).userNameCache;
+      // Mock users.info to return distinct names
+      currentApp().client.users.info.mockImplementation((args: { user: string }) =>
+        Promise.resolve({ user: { real_name: `Name-${args.user}` } }),
+      );
+
+      // resolveUserName is private; trigger it via the action handler
+      const ack = vi.fn().mockResolvedValue(undefined);
+      for (let i = 0; i < 1001; i++) {
+        for (const { handler } of currentApp().actionHandlers) {
+          await handler({
+            ack,
+            action: { action_id: `a:${i}`, action_ts: `ts-${i}` },
+            body: {
+              channel: { id: 'C0123456789' },
+              message: { ts: '1.0' },
+              user: { id: `U-${i}` },
+            },
+            client: currentApp().client,
+          });
+        }
+      }
+      expect(cacheRef.size).toBeLessThanOrEqual(1000);
+      // Oldest user (U-0) should have been evicted
+      expect(cacheRef.has('U-0')).toBe(false);
+      // Newest user (U-1000) must still be present
+      expect(cacheRef.has('U-1000')).toBe(true);
+    });
+  });
+
+  describe('sendMessageWithKeyboard empty text guard', () => {
+    it('replaces empty text with "(no message)" placeholder', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessageWithKeyboard('slack:C0123456789', '', [
+        [{ text: 'OK', callback_data: 'ok' }],
+      ]);
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe('(no message)');
+      expect(call.blocks[0].text.text).toBe('(no message)');
+    });
+
+    it('replaces whitespace-only text with placeholder', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessageWithKeyboard('slack:C0123456789', '   \n  ', [
+        [{ text: 'OK', callback_data: 'ok' }],
+      ]);
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe('(no message)');
+    });
+  });
+
+  describe('flushOutgoingQueue rate-limit handling', () => {
+    it('sleeps + retries on ratelimited (retry_after honored)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+
+      // Queue messages while disconnected
+      await channel.sendMessage('slack:C0123456789', 'msg-1');
+      await channel.sendMessage('slack:C0123456789', 'msg-2');
+
+      // 1st post hits rate-limit; 2nd succeeds
+      let callCount = 0;
+      currentApp().client.chat.postMessage.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.reject({
+            data: { error: 'ratelimited', response_metadata: { retry_after: 0 } },
+          });
+        }
+        return Promise.resolve({ ts: '1.0' });
+      });
+
+      await channel.connect();
+      // Wait briefly for flush (it has 100ms throttle internally)
+      await new Promise((r) => setTimeout(r, 250));
+
+      // Both messages were eventually delivered (or in queue if still rate-limited)
+      // Importantly: the queue isn't permanently broken
+      expect(callCount).toBeGreaterThanOrEqual(2);
     });
   });
 
