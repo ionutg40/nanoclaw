@@ -1,6 +1,6 @@
 ---
 name: grade-review
-description: Process Monica's CapYear grade verification queue. Use whenever the user sends `/review`, asks to "check grades", "process pending", "verify scores", or anything similar in the CapYear Grades group. Calls bot_cli.py to fetch pending decisions and presents them on Telegram with inline keyboards.
+description: Process Monica's CapYear grade verification queue. Use whenever the user sends `/review`, says "review", asks to "check grades", "process pending", "verify scores", anything similar in the CapYear Grades group, OR sends a `[callback] data=...` message (which is how inline-button taps arrive — load session_state.json and act on the encoded action). Calls bot_cli.py to fetch pending decisions and presents them with inline keyboards (Telegram Bot API or Slack Block Kit).
 allowed-tools: Bash, Read, Write
 ---
 

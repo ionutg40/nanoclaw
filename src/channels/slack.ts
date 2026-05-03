@@ -23,6 +23,32 @@ import {
 // Messages exceeding this are split into sequential chunks.
 const MAX_MESSAGE_LENGTH = 4000;
 
+// Cap outgoingQueue so a Slack outage doesn't grow it unbounded. At cap, oldest
+// entries are dropped — better to lose old chatter than crash the whole bot.
+const MAX_QUEUE_SIZE = 500;
+
+/**
+ * Translate Telegram-flavored Markdown (CommonMark-ish, used by the existing
+ * skills) into Slack mrkdwn. Skills emit `**bold**`, `*italic*`, `[text](url)`
+ * which Slack would render as literal asterisks and broken links.
+ *
+ * Order matters: bold first (`**x**` -> `*x*`), then italic (`*x*` -> `_x_`)
+ * so we don't double-translate bold into italic.
+ */
+function telegramMdToSlackMrkdwn(text: string): string {
+  if (!text) return text;
+  // Bold: **x** -> *x*  (also `__x__` form -> *x*)
+  let out = text.replace(/\*\*([^*\n]+?)\*\*/g, '*$1*');
+  out = out.replace(/__([^_\n]+?)__/g, '*$1*');
+  // Italic: single *x* -> _x_  (only if not already part of a bold pattern)
+  // Simpler: any single * that isn't inside our newly-bolded form stays as bold
+  // in Slack which is acceptable. We translate underscore italics: `_x_` is
+  // already Slack italic, leave alone.
+  // Links: [text](url) -> <url|text>
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>');
+  return out;
+}
+
 // The message subtypes we process. Bolt delivers all subtypes via app.event('message');
 // we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
 // (BotMessageEvent, subtype 'bot_message') so we can track our own output.
@@ -171,6 +197,13 @@ export class SlackChannel implements Channel {
       const userId = slackBody.user?.id || '';
       const userName =
         slackBody.user?.name || slackBody.user?.username || userId || 'Unknown';
+      // action_ts is unique per click (different on legit re-click of the same
+      // button after edit; same on Bolt's slow-ack retry of one click). value
+      // ts also exists on action object — both are fallbacks.
+      const actionTs =
+        (action as { action_ts?: string }).action_ts ||
+        (action as { ts?: string }).ts ||
+        '';
 
       if (!channelId) {
         logger.warn(
@@ -210,8 +243,12 @@ export class SlackChannel implements Channel {
         originalMsgTs ? ` original_message_id=${originalMsgTs}` : ''
       }`;
 
+      // Synthetic id includes action_ts so the orchestrator can dedupe Bolt
+      // slow-ack retries (same id) while still distinguishing legitimate
+      // re-clicks on the same button after a chat.update (different
+      // action_ts).
       this.opts.onMessage(jid, {
-        id: `${originalMsgTs || timestamp}:${data}`,
+        id: `${originalMsgTs || timestamp}:${data}:${actionTs || timestamp}`,
         chat_jid: jid,
         sender: userId,
         sender_name: senderName,
@@ -223,13 +260,69 @@ export class SlackChannel implements Channel {
       });
 
       logger.info(
-        { jid, sender: senderName, data, originalMsgTs },
+        { jid, sender: senderName, data, originalMsgTs, actionTs },
         'Slack block_action delivered',
       );
 
       // Mark client unused so eslint doesn't complain — Bolt provides it but
       // we don't need it here (we use this.app.client when needed elsewhere).
       void client;
+    });
+
+    // ---- Slash commands ----
+    //
+    // Slack reserves /<word> patterns for its own dispatcher. To use one with
+    // our app we register an explicit handler. The simplest approach is to
+    // ack and forward the command as a synthetic message so the agent's
+    // skill matching handles it identically to plain-text triggers.
+    this.app.command(/.*/, async ({ ack, command }) => {
+      try {
+        await ack();
+      } catch (err) {
+        logger.warn({ err }, 'Slack command ack failed (non-fatal)');
+      }
+
+      const channelId = command.channel_id;
+      const userId = command.user_id || '';
+      const userName = command.user_name || userId || 'Unknown';
+      // Strip leading slash so the skill matches its natural-language triggers
+      // (e.g. /review -> "review", /grade 123 approve -> "grade 123 approve").
+      const slashCommand = (command.command || '').replace(/^\//, '');
+      const text = command.text ? `${slashCommand} ${command.text}` : slashCommand;
+      const timestamp = new Date().toISOString();
+      const jid = `slack:${channelId}`;
+
+      this.opts.onChatMetadata(jid, timestamp, undefined, 'slack', true);
+
+      const groups = this.opts.registeredGroups();
+      if (!groups[jid]) {
+        logger.debug(
+          { jid, slashCommand },
+          'Slack command from unregistered chat, dropping',
+        );
+        return;
+      }
+
+      let senderName = userName;
+      if (userId) {
+        const resolved = await this.resolveUserName(userId);
+        if (resolved) senderName = resolved;
+      }
+
+      this.opts.onMessage(jid, {
+        id: `slash:${command.trigger_id || timestamp}`,
+        chat_jid: jid,
+        sender: userId,
+        sender_name: senderName,
+        content: text,
+        timestamp,
+        is_from_me: false,
+      });
+
+      logger.info(
+        { jid, sender: senderName, slashCommand, text },
+        'Slack slash command delivered',
+      );
     });
   }
 
@@ -268,20 +361,34 @@ export class SlackChannel implements Channel {
       return;
     }
 
+    // Translate Telegram MD before sending so plain-text messages from skills
+    // also render correctly on Slack.
+    const slackText = telegramMdToSlackMrkdwn(text);
     try {
       // Slack limits messages to ~4000 characters; split if needed
-      if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+      if (slackText.length <= MAX_MESSAGE_LENGTH) {
+        await this.app.client.chat.postMessage({
+          channel: channelId,
+          text: slackText,
+        });
       } else {
-        for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
+        for (let i = 0; i < slackText.length; i += MAX_MESSAGE_LENGTH) {
           await this.app.client.chat.postMessage({
             channel: channelId,
-            text: text.slice(i, i + MAX_MESSAGE_LENGTH),
+            text: slackText.slice(i, i + MAX_MESSAGE_LENGTH),
           });
         }
       }
-      logger.info({ jid, length: text.length }, 'Slack message sent');
+      logger.info({ jid, length: slackText.length }, 'Slack message sent');
     } catch (err) {
+      // Cap queue: drop oldest if over MAX_QUEUE_SIZE.
+      if (this.outgoingQueue.length >= MAX_QUEUE_SIZE) {
+        const dropped = this.outgoingQueue.shift();
+        logger.warn(
+          { jid: dropped?.jid, queueSize: MAX_QUEUE_SIZE },
+          'Slack outgoing queue at cap, dropping oldest entry',
+        );
+      }
       this.outgoingQueue.push({ jid, text });
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
@@ -328,10 +435,11 @@ export class SlackChannel implements Channel {
     text: string,
     keyboard: InlineKeyboard | null,
   ): (Block | KnownBlock)[] {
+    const slackText = telegramMdToSlackMrkdwn(text || ' ');
     const blocks: (Block | KnownBlock)[] = [
       {
         type: 'section',
-        text: { type: 'mrkdwn', text: text || ' ' },
+        text: { type: 'mrkdwn', text: slackText },
       },
     ];
     if (keyboard) {
@@ -405,15 +513,23 @@ export class SlackChannel implements Channel {
       });
       logger.info({ jid, messageId }, 'Slack message edited');
     } catch (err: unknown) {
-      const errMsg = (err as { data?: { error?: string }; message?: string })
-        ?.data?.error || (err as { message?: string })?.message || String(err);
-      // message_not_found / cant_update_message / edit_window_closed are
-      // non-fatal — log and move on. Other errors propagate so callers see them.
-      if (
-        errMsg === 'message_not_found' ||
-        errMsg === 'cant_update_message' ||
-        errMsg === 'edit_window_closed'
-      ) {
+      const errMsg =
+        (err as { data?: { error?: string }; message?: string })?.data?.error ||
+        (err as { message?: string })?.message ||
+        String(err);
+      // Non-fatal: target gone, archived, or edit window closed. Log and move
+      // on; the alternative (throwing) breaks long batch flows like
+      // process-backlog when one channel was archived mid-drain.
+      const swallowed = new Set([
+        'message_not_found',
+        'cant_update_message',
+        'edit_window_closed',
+        'channel_not_found',
+        'is_archived',
+        'channel_archived',
+        'not_in_channel',
+      ]);
+      if (swallowed.has(errMsg)) {
         logger.debug(
           { jid, messageId, errMsg },
           'Slack editMessage non-fatal failure',
@@ -437,8 +553,10 @@ export class SlackChannel implements Channel {
       });
       logger.info({ jid, messageId }, 'Slack message deleted');
     } catch (err: unknown) {
-      const errMsg = (err as { data?: { error?: string }; message?: string })
-        ?.data?.error || (err as { message?: string })?.message || String(err);
+      const errMsg =
+        (err as { data?: { error?: string }; message?: string })?.data?.error ||
+        (err as { message?: string })?.message ||
+        String(err);
       logger.debug(
         { jid, messageId, errMsg },
         'Slack deleteMessage non-fatal failure',
