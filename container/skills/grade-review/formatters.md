@@ -1,6 +1,18 @@
-# Telegram Message Templates — grade-review
+# Message Templates — grade-review
 
-These are the exact shapes the agent should produce. Stay within Telegram MarkdownV1 constraints (the rest of the group rules apply: `*bold*`, `_italic_`, `•`, NO `##`, NO `[link](url)`, NO `**`).
+These are the exact shapes the agent should produce. The format works on
+both channels (Telegram parse_mode='Markdown' V1 + Slack mrkdwn share most
+of their syntax):
+
+- `*bold*` (single asterisks) — bold on both channels
+- `_italic_` (single underscores) — italic on both channels
+- `` `code` `` and ``` ``` `` triple-backtick fences ``` `` ``` — verbatim on both
+- `•` for bullets (Unicode, both render)
+- `[text](url)` — Telegram-only; the Slack channel auto-translates to `<url|text>`
+- AVOID `##` heading markers — show literally on both
+- AVOID `**bold**` (double asterisks) — Telegram V1 shows literal asterisks;
+  defensive translation in the Slack channel converts to `*bold*`, but emit
+  single-star directly to be safe
 
 PII rule: **first name + last initial + assessment shortcode** in summary lines. NEVER full email or full student ID. Reserve full PII for `[Details]` and delete on Back.
 
@@ -50,8 +62,8 @@ Where `K1..K4` are session-scoped tokens you generate (e.g. `K1`, `K2`...) and m
 
 ### Length / button limits
 
-- Telegram message body ≤ 4096 chars. If summary > 3500 chars, drop the per-student bullets after first 3 per group, replace with `... and (N) more`.
-- Telegram keyboard ≤ 100 buttons. Above that, split into multi-message: one message per group, each with its own `[Confirm all] [Review individually]` pair.
+- Message body ≤ 4000 chars (Slack section blocks are 3000 — channel layer auto-truncates with a `_…[N chars truncated]_` suffix). If summary > 2900 chars, drop the per-student bullets after first 3 per group, replace with `... and (N) more`.
+- Inline keyboard ≤ 100 buttons (Telegram cap; Slack's actions block holds 25 per row — use multiple rows). Above 100 total, split into multi-message: one message per group, each with its own `[Confirm all] [Review individually]` pair.
 
 ## Individual review card
 
@@ -102,7 +114,7 @@ Buttons:
 ```
 [ ← Back ]
 ```
-On `[← Back]`, edit message back to the compact card above. **Then `mcp__nanoclaw__send_message` with `text=""` is NOT how you delete** — instead, edit the message to remove PII content and continue. (Telegram bots can `deleteMessage` within 48h, but for the [Back] flow we just overwrite text via `edit_message`.)
+On `[← Back]`, edit message back to the compact card above. **Then `mcp__nanoclaw__send_message` with `text=""` is NOT how you delete** — instead, edit the message to remove PII content via `edit_message`. (Both channels support `delete_message` for stricter PII hygiene if needed: Telegram has a 48h window, Slack accepts any age for bot-owned messages.)
 
 ## After action — status edit + PII cleanup
 

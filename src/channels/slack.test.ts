@@ -1120,25 +1120,44 @@ describe('SlackChannel', () => {
       expect(call.blocks[0].text.text).toBe('See <https://example.com|docs>');
     });
 
-    it('translates *italic* (Telegram) to _italic_ (Slack)', async () => {
-      const opts = createTestOpts();
-      const channel = new SlackChannel(opts);
-      await channel.connect();
-      await channel.sendMessage('slack:C0123456789', 'Note: *do not* skip');
-      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
-      expect(call.text).toBe('Note: _do not_ skip');
-    });
-
-    it('preserves bold AND italic distinct in same message', async () => {
+    it('preserves single-asterisk bold (Telegram V1 + Slack mrkdwn both treat *x* as bold)', async () => {
+      // CRITICAL contract: skill emits `*Pending Review*` for bold (per
+      // Telegram V1 convention which the skill ecosystem was built on).
+      // Slack mrkdwn ALSO treats `*x*` as bold. Channel must not flip this
+      // to `_x_` (italic) — that was the bug motivating the V2 translator.
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
       await channel.connect();
       await channel.sendMessage(
         'slack:C0123456789',
-        '**bold** and *italic* together',
+        '*Pending Review — 50 submissions*',
       );
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
-      expect(call.text).toBe('*bold* and _italic_ together');
+      expect(call.text).toBe('*Pending Review — 50 submissions*');
+    });
+
+    it('preserves _italic_ underscore form on both channels', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'Note: _do not_ skip',
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe('Note: _do not_ skip');
+    });
+
+    it('translates **bold** (CommonMark) to *bold* defensively', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'CommonMark **important** statement',
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe('CommonMark *important* statement');
     });
 
     it('preserves URL containing balanced parens (Wikipedia)', async () => {
@@ -1190,7 +1209,8 @@ describe('SlackChannel', () => {
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
       expect(call.text).toContain('x = a**b**');
       expect(call.text).toContain('[docs](https://x)');
-      expect(call.text).toContain('_italic_ outside');
+      // *italic* outside fences is bold on both channels — no translation
+      expect(call.text).toContain('*italic* outside');
     });
 
     it('handles unbalanced markdown gracefully (no crash)', async () => {
@@ -1231,9 +1251,7 @@ describe('SlackChannel', () => {
         'First `**code1**` then **bold** then `code2` end',
       );
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
-      expect(call.text).toBe(
-        'First `**code1**` then *bold* then `code2` end',
-      );
+      expect(call.text).toBe('First `**code1**` then *bold* then `code2` end');
     });
 
     it('preserves URL with query string + hash + spaces', async () => {
@@ -1245,9 +1263,7 @@ describe('SlackChannel', () => {
         'Try [this](https://x.io/path?a=1&b=2#section)',
       );
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
-      expect(call.text).toBe(
-        'Try <https://x.io/path?a=1&b=2#section|this>',
-      );
+      expect(call.text).toBe('Try <https://x.io/path?a=1&b=2#section|this>');
     });
 
     it('translates bold inside list items', async () => {
@@ -1259,9 +1275,8 @@ describe('SlackChannel', () => {
         '• First **item**\n• Second **item**\n• Third *one*',
       );
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
-      expect(call.text).toBe(
-        '• First *item*\n• Second *item*\n• Third _one_',
-      );
+      // *bold* and *one* both stay as bold (no italic translation)
+      expect(call.text).toBe('• First *item*\n• Second *item*\n• Third *one*');
     });
 
     it('handles empty input safely', async () => {
