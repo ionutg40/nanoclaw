@@ -1307,6 +1307,69 @@ describe('SlackChannel', () => {
     });
   });
 
+  describe('action_ts retry simulation (Bolt slow-ack retry)', () => {
+    it('produces SAME synthetic id on identical retry payload (orchestrator dedupes)', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      const ack = vi.fn().mockResolvedValue(undefined);
+      const samePayload = {
+        ack,
+        action: { action_id: 'a:7f3a', action_ts: '1704067210.111' },
+        body: {
+          channel: { id: 'C0123456789' },
+          message: { ts: '1704067200.000' },
+          user: { id: 'U_USER_456' },
+        },
+        client: currentApp().client,
+      };
+      // Slack delivers the SAME payload twice when ack was slow on first try
+      for (const { handler } of currentApp().actionHandlers) {
+        await handler(samePayload);
+        await handler(samePayload);
+      }
+
+      expect(onMessage).toHaveBeenCalledTimes(2);
+      const id1 = onMessage.mock.calls[0][1].id;
+      const id2 = onMessage.mock.calls[1][1].id;
+      // Identical ids let downstream orchestrator dedupe Bolt retries cleanly
+      expect(id1).toBe(id2);
+    });
+  });
+
+  describe('error shape coverage (WebAPIRequestError + generic Error)', () => {
+    it('extracts message from WebAPIRequestError shape (no .data, has .message)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // WebAPIRequestError = network/transport error, has .message but no .data
+      const networkErr = Object.assign(new Error('socket hangup'), {
+        code: 'slack_webapi_request_error',
+      });
+      currentApp().client.chat.update.mockRejectedValueOnce(networkErr);
+
+      // Should NOT swallow (errMsg='socket hangup' is not in any swallow set)
+      await expect(
+        channel.editMessage('slack:C0123456789', '1.0', 'x', null),
+      ).rejects.toBeTruthy();
+    });
+
+    it('extracts message from generic Error (no .data, no .code)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.chat.update.mockRejectedValueOnce(
+        new Error('unexpected runtime'),
+      );
+      await expect(
+        channel.editMessage('slack:C0123456789', '1.0', 'x', null),
+      ).rejects.toBeTruthy();
+    });
+  });
+
   describe('action_ts monotonic counter fallback', () => {
     it('uses seq counter when action has no action_ts/ts', async () => {
       const onMessage = vi.fn();
@@ -1372,12 +1435,15 @@ describe('SlackChannel', () => {
       await channel.connect();
 
       // Force resolve 1001 distinct users — 1001st triggers eviction
-      const cacheRef = (channel as unknown as {
-        userNameCache: Map<string, string>;
-      }).userNameCache;
+      const cacheRef = (
+        channel as unknown as {
+          userNameCache: Map<string, string>;
+        }
+      ).userNameCache;
       // Mock users.info to return distinct names
-      currentApp().client.users.info.mockImplementation((args: { user: string }) =>
-        Promise.resolve({ user: { real_name: `Name-${args.user}` } }),
+      currentApp().client.users.info.mockImplementation(
+        (args: { user: string }) =>
+          Promise.resolve({ user: { real_name: `Name-${args.user}` } }),
       );
 
       // resolveUserName is private; trigger it via the action handler
@@ -1444,7 +1510,10 @@ describe('SlackChannel', () => {
         callCount++;
         if (callCount === 1) {
           return Promise.reject({
-            data: { error: 'ratelimited', response_metadata: { retry_after: 0 } },
+            data: {
+              error: 'ratelimited',
+              response_metadata: { retry_after: 0 },
+            },
           });
         }
         return Promise.resolve({ ts: '1.0' });

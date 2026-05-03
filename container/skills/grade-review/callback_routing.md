@@ -1,6 +1,6 @@
 # Callback Routing — grade-review
 
-Telegram limits `callback_data` to **64 bytes**. Submission IDs from LearnWorlds are ~24 chars hex; once you also need an action prefix and may want versioning, you're tight on room. Pattern: keep callback_data opaque + short, hold the real state in a session map.
+Keep `callback_data` ≤ **64 bytes**. Telegram's hard cap; Slack accepts up to 255, but using one budget keeps callbacks identical across channels. Submission IDs from LearnWorlds are ~24 chars hex; once you also need an action prefix and want versioning, you're tight on room. Pattern: keep callback_data opaque + short, hold the real state in a session map.
 
 ## Encoding scheme
 
@@ -123,7 +123,7 @@ On callback message arrival:
 
 If Monica double-taps the same button before the first call finishes:
 1. The first callback triggers `submit` + `edit_message` (which removes the keyboard).
-2. The second callback hits a message with no keyboard. Telegram will let the second tap go through, but `answerCallbackQuery` is already auto-handled by the channel.
+2. The second callback hits a message with no keyboard. Both Telegram and Slack will let the second tap go through; ack is already auto-handled by the channel layer.
 3. In the agent, on every callback, FIRST check if `state.decisions[short_id].acted_at` is set. If so, ignore and reply silently — don't re-submit.
 
 Set `state.decisions[short_id].acted_at = now()` AFTER the submit completes (success or error). This guards against duplicate writes.

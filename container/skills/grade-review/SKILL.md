@@ -8,7 +8,7 @@ allowed-tools: Bash, Read, Write
 
 Trigger: `/review`, "check grades", "process pending", "verify scores", "let's review". For ambiguous chat, do NOT invoke — reply naturally.
 
-## Receiving a fresh NHA CSV (Telegram attachment)
+## Receiving a fresh NHA CSV (chat attachment)
 
 When the user (Monica) sends a CSV file in the chat, the channel stores it
 at `/workspace/group/attachments/<filename>.csv` and you receive a message
@@ -99,10 +99,10 @@ NEVER hide a partial failure — surface failed submission IDs inline.
 
 ## PII handling (mandatory)
 
-Telegram is NOT end-to-end encrypted for bot chats. Messages sit in Telegram's cloud. Minimize exposure:
+Chat platforms (Telegram and Slack alike) are NOT end-to-end encrypted for bot conversations — messages sit on the platform's cloud. Minimize exposure:
 
 - **Summary + individual cards:** first name + last initial + score + short assessment label. NEVER full email, full submission_id, or full student_id.
-- **Details view is the ONLY place full PII appears.** Restore the compact card on `[← Back]` (via `edit_message` — Telegram has no "delete content" primitive for in-place).
+- **Details view is the ONLY place full PII appears.** Restore the compact card on `[← Back]` (via `edit_message`). On Telegram this is the only in-place option; on Slack `delete_message` is also available for stricter PII hygiene.
 - **After every successful submit**, call `mcp__nanoclaw__delete_message(messageId=<the original decision prompt message_id>)` so the PII-bearing prompt disappears from the chat. Status/summary messages (counts only, no PII) stay.
 - If `delete_message` fails (message >48h old or already gone), it's non-fatal — the tool is silent on those. Don't retry.
 - Don't log PII inside `<internal>` tags either — internal logs persist on the host.
