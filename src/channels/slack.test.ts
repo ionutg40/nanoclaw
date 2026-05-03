@@ -1193,6 +1193,88 @@ describe('SlackChannel', () => {
       expect(call.text).toContain('_italic_ outside');
     });
 
+    it('handles unbalanced markdown gracefully (no crash)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Each pathological input must not throw. Result format may vary;
+      // contract is "no exception, output is a string".
+      const cases = [
+        '**unbalanced bold',
+        '*unbalanced italic',
+        '[link without closing](url',
+        '[link]( without close',
+        '[]()',
+        '`unclosed code',
+        '```\nunclosed fence',
+        '***triple***',
+        '****quad****',
+        '* * * *',
+        '[a](b)[c](d)',
+      ];
+      for (const input of cases) {
+        await channel.sendMessage('slack:C0123456789', input);
+      }
+      // All N succeeded
+      expect(currentApp().client.chat.postMessage.mock.calls.length).toBe(
+        cases.length,
+      );
+    });
+
+    it('handles multiple consecutive code spans correctly', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'First `**code1**` then **bold** then `code2` end',
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe(
+        'First `**code1**` then *bold* then `code2` end',
+      );
+    });
+
+    it('preserves URL with query string + hash + spaces', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'Try [this](https://x.io/path?a=1&b=2#section)',
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe(
+        'Try <https://x.io/path?a=1&b=2#section|this>',
+      );
+    });
+
+    it('translates bold inside list items', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '• First **item**\n• Second **item**\n• Third *one*',
+      );
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.text).toBe(
+        '• First *item*\n• Second *item*\n• Third _one_',
+      );
+    });
+
+    it('handles empty input safely', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+      // Empty text -> sendMessage doesn't translate (translator returns '')
+      // But postMessage may reject empty — mock accepts everything
+      await channel.sendMessage('slack:C0123456789', '');
+      // No crash; postMessage was called (with empty text)
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalled();
+    });
+
     it('truncates section text over 3000 chars (Slack limit)', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
@@ -1304,6 +1386,102 @@ describe('SlackChannel', () => {
         await handler({ ack, command, client: currentApp().client });
       }
       expect(onMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('block_action defensive paths (missing fields)', () => {
+    it('drops action without channel context (warn + return)', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      const ack = vi.fn().mockResolvedValue(undefined);
+      for (const { handler } of currentApp().actionHandlers) {
+        await handler({
+          ack,
+          action: { action_id: 'a:7f3a', action_ts: '1.0' },
+          body: {
+            // no channel
+            message: { ts: '1.0' },
+            user: { id: 'U1' },
+          },
+          client: currentApp().client,
+        });
+      }
+      expect(onMessage).not.toHaveBeenCalled();
+      expect(ack).toHaveBeenCalled();
+    });
+
+    it('handles action without action_id, falls back to value', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      const ack = vi.fn().mockResolvedValue(undefined);
+      for (const { handler } of currentApp().actionHandlers) {
+        await handler({
+          ack,
+          action: { value: 'fallback_value', action_ts: '1.0' },
+          body: {
+            channel: { id: 'C0123456789' },
+            message: { ts: '1.0' },
+            user: { id: 'U1' },
+          },
+          client: currentApp().client,
+        });
+      }
+      expect(onMessage).toHaveBeenCalledTimes(1);
+      const msg = onMessage.mock.calls[0][1];
+      expect(msg.callback_data).toBe('fallback_value');
+    });
+
+    it('handles action with neither action_id nor value (defaults to empty string)', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      const ack = vi.fn().mockResolvedValue(undefined);
+      for (const { handler } of currentApp().actionHandlers) {
+        await handler({
+          ack,
+          action: { action_ts: '1.0' }, // no action_id, no value
+          body: {
+            channel: { id: 'C0123456789' },
+            message: { ts: '1.0' },
+            user: { id: 'U1' },
+          },
+          client: currentApp().client,
+        });
+      }
+      // Empty data still delivered — skill side will see content="[callback] data="
+      expect(onMessage).toHaveBeenCalledTimes(1);
+      expect(onMessage.mock.calls[0][1].callback_data).toBe('');
+    });
+
+    it('handles missing message.ts (action without original message context)', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      const ack = vi.fn().mockResolvedValue(undefined);
+      for (const { handler } of currentApp().actionHandlers) {
+        await handler({
+          ack,
+          action: { action_id: 'a:7f3a', action_ts: '1.0' },
+          body: {
+            channel: { id: 'C0123456789' },
+            // no message
+            user: { id: 'U1' },
+          },
+          client: currentApp().client,
+        });
+      }
+      expect(onMessage).toHaveBeenCalledTimes(1);
+      const msg = onMessage.mock.calls[0][1];
+      // callback_message_id is undefined when no message
+      expect(msg.callback_message_id).toBeUndefined();
+      // synthetic id falls back to ISO timestamp instead of message_ts
+      expect(msg.id).toContain(':a:7f3a:');
     });
   });
 
