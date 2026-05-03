@@ -38,12 +38,16 @@ vi.mock('@slack/bolt', () => ({
     token: string;
     appToken: string;
 
+    actionHandlers: { pattern: RegExp | string; handler: Handler }[] = [];
+
     client = {
       auth: {
         test: vi.fn().mockResolvedValue({ user_id: 'U_BOT_123' }),
       },
       chat: {
-        postMessage: vi.fn().mockResolvedValue(undefined),
+        postMessage: vi.fn().mockResolvedValue({ ts: '1704067200.999999' }),
+        update: vi.fn().mockResolvedValue({ ok: true }),
+        delete: vi.fn().mockResolvedValue({ ok: true }),
       },
       conversations: {
         list: vi.fn().mockResolvedValue({
@@ -66,6 +70,10 @@ vi.mock('@slack/bolt', () => ({
 
     event(name: string, handler: Handler) {
       this.eventHandlers.set(name, handler);
+    }
+
+    action(pattern: RegExp | string, handler: Handler) {
+      this.actionHandlers.push({ pattern, handler });
     }
 
     async start() {}
@@ -132,9 +140,39 @@ function currentApp() {
   return appRef.current;
 }
 
-async function triggerMessageEvent(event: ReturnType<typeof createMessageEvent>) {
+async function triggerMessageEvent(
+  event: ReturnType<typeof createMessageEvent>,
+) {
   const handler = currentApp().eventHandlers.get('message');
   if (handler) await handler({ event });
+}
+
+async function triggerBlockAction(payload: {
+  action_id: string;
+  channel?: string;
+  message_ts?: string;
+  user_id?: string;
+  user_name?: string;
+}) {
+  const ack = vi.fn().mockResolvedValue(undefined);
+  const action = { action_id: payload.action_id, value: payload.action_id };
+  const body = {
+    channel: { id: payload.channel ?? 'C0123456789' },
+    message: { ts: payload.message_ts ?? '1704067200.000000' },
+    user: {
+      id: payload.user_id ?? 'U_USER_456',
+      username: payload.user_name ?? 'alice',
+    },
+  };
+  // Match any registered action handler whose pattern matches the action_id
+  for (const { pattern, handler } of currentApp().actionHandlers) {
+    const re = pattern instanceof RegExp ? pattern : new RegExp(pattern);
+    if (re.test(payload.action_id)) {
+      await handler({ ack, action, body, client: currentApp().client });
+      return ack;
+    }
+  }
+  return ack;
 }
 
 // --- Tests ---
@@ -309,7 +347,10 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
 
-      const event = createMessageEvent({ user: 'U_BOT_123', text: 'Self message' });
+      const event = createMessageEvent({
+        user: 'U_BOT_123',
+        text: 'Self message',
+      });
       await triggerMessageEvent(event);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -391,13 +432,17 @@ describe('SlackChannel', () => {
       await channel.connect();
 
       // First message — API call
-      await triggerMessageEvent(createMessageEvent({ user: 'U_USER_456', text: 'First' }));
+      await triggerMessageEvent(
+        createMessageEvent({ user: 'U_USER_456', text: 'First' }),
+      );
       // Second message — should use cache
-      await triggerMessageEvent(createMessageEvent({
-        user: 'U_USER_456',
-        text: 'Second',
-        ts: '1704067201.000000',
-      }));
+      await triggerMessageEvent(
+        createMessageEvent({
+          user: 'U_USER_456',
+          text: 'Second',
+          ts: '1704067201.000000',
+        }),
+      );
 
       expect(currentApp().client.users.info).toHaveBeenCalledTimes(1);
     });
@@ -407,7 +452,9 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
 
-      currentApp().client.users.info.mockRejectedValueOnce(new Error('API error'));
+      currentApp().client.users.info.mockRejectedValueOnce(
+        new Error('API error'),
+      );
 
       const event = createMessageEvent({ user: 'U_UNKNOWN', text: 'Hi' });
       await triggerMessageEvent(event);
@@ -778,6 +825,305 @@ describe('SlackChannel', () => {
     });
   });
 
+  // --- Interactive messages (Block Kit) ---
+
+  describe('sendMessageWithKeyboard', () => {
+    it('posts a section + actions block with the keyboard buttons', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const result = await channel.sendMessageWithKeyboard(
+        'slack:C0123456789',
+        'Pick one',
+        [
+          [
+            { text: 'Approve', callback_data: 'a:7f3a' },
+            { text: 'Bounce', callback_data: 'x:7f3a' },
+          ],
+        ],
+      );
+
+      expect(result.messageId).toBe('1704067200.999999');
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call.channel).toBe('C0123456789');
+      expect(call.text).toBe('Pick one');
+      expect(call.blocks[0]).toMatchObject({
+        type: 'section',
+        text: { type: 'mrkdwn', text: 'Pick one' },
+      });
+      expect(call.blocks[1]).toMatchObject({
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'Approve' },
+            action_id: 'a:7f3a',
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'Bounce' },
+            action_id: 'x:7f3a',
+          },
+        ],
+      });
+    });
+
+    it('emits one actions block per keyboard row', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessageWithKeyboard('slack:C0123456789', 'Title', [
+        [{ text: 'Row1Btn', callback_data: 'r1' }],
+        [{ text: 'Row2Btn', callback_data: 'r2' }],
+        [{ text: 'Row3Btn', callback_data: 'r3' }],
+      ]);
+
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      // 1 section + 3 actions
+      expect(call.blocks).toHaveLength(4);
+      expect(call.blocks[0].type).toBe('section');
+      expect(call.blocks[1].type).toBe('actions');
+      expect(call.blocks[2].type).toBe('actions');
+      expect(call.blocks[3].type).toBe('actions');
+    });
+
+    it('throws when chat.postMessage returns no ts', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.chat.postMessage.mockResolvedValueOnce({});
+
+      await expect(
+        channel.sendMessageWithKeyboard('slack:C0123456789', 'x', [
+          [{ text: 'A', callback_data: 'a' }],
+        ]),
+      ).rejects.toThrow(/no ts/);
+    });
+
+    it('skips empty rows (no actions block emitted)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessageWithKeyboard('slack:C0123456789', 'x', [
+        [],
+        [{ text: 'A', callback_data: 'a' }],
+      ]);
+
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      // section + 1 actions (empty row dropped)
+      expect(call.blocks).toHaveLength(2);
+    });
+  });
+
+  describe('editMessage', () => {
+    it('updates with new text + keyboard via chat.update', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.editMessage(
+        'slack:C0123456789',
+        '1704067200.000000',
+        '✓ Approved',
+        [[{ text: 'Undo', callback_data: 'undo:7f3a' }]],
+      );
+
+      const call = currentApp().client.chat.update.mock.calls[0][0];
+      expect(call.channel).toBe('C0123456789');
+      expect(call.ts).toBe('1704067200.000000');
+      expect(call.text).toBe('✓ Approved');
+      expect(call.blocks).toHaveLength(2);
+      expect(call.blocks[1].elements[0].action_id).toBe('undo:7f3a');
+    });
+
+    it('removes keyboard when keyboard=null', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.editMessage(
+        'slack:C0123456789',
+        '1704067200.000000',
+        '✓ Done',
+        null,
+      );
+
+      const call = currentApp().client.chat.update.mock.calls[0][0];
+      expect(call.blocks).toHaveLength(1); // section only
+      expect(call.blocks[0].type).toBe('section');
+    });
+
+    it('treats keyboard=undefined as null (Slack-specific simplification)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.editMessage(
+        'slack:C0123456789',
+        '1704067200.000000',
+        '✓ Done',
+      );
+
+      const call = currentApp().client.chat.update.mock.calls[0][0];
+      expect(call.blocks).toHaveLength(1);
+    });
+
+    it('swallows message_not_found gracefully', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.chat.update.mockRejectedValueOnce({
+        data: { error: 'message_not_found' },
+      });
+
+      await expect(
+        channel.editMessage('slack:C0123456789', '1.000', 'x', null),
+      ).resolves.toBeUndefined();
+    });
+
+    it('swallows cant_update_message gracefully', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.chat.update.mockRejectedValueOnce({
+        data: { error: 'cant_update_message' },
+      });
+
+      await expect(
+        channel.editMessage('slack:C0123456789', '1.000', 'x', null),
+      ).resolves.toBeUndefined();
+    });
+
+    it('propagates other errors', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.chat.update.mockRejectedValueOnce({
+        data: { error: 'rate_limited' },
+      });
+
+      await expect(
+        channel.editMessage('slack:C0123456789', '1.000', 'x', null),
+      ).rejects.toBeTruthy();
+    });
+  });
+
+  describe('deleteMessage', () => {
+    it('calls chat.delete with channel + ts', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.deleteMessage('slack:C0123456789', '1704067200.000000');
+
+      const call = currentApp().client.chat.delete.mock.calls[0][0];
+      expect(call.channel).toBe('C0123456789');
+      expect(call.ts).toBe('1704067200.000000');
+    });
+
+    it('swallows errors silently (PII hygiene best-effort)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.chat.delete.mockRejectedValueOnce({
+        data: { error: 'message_not_found' },
+      });
+
+      await expect(
+        channel.deleteMessage('slack:C0123456789', '1.000'),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  describe('block_actions handler', () => {
+    it('registers an action handler covering all action_ids', () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+      expect(currentApp().actionHandlers.length).toBeGreaterThan(0);
+    });
+
+    it('calls ack() immediately (Slack 3s window)', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      const ack = await triggerBlockAction({ action_id: 'a:7f3a' });
+      expect(ack).toHaveBeenCalled();
+    });
+
+    it('synthesizes a [callback] message with callback_data + message_id', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      await triggerBlockAction({
+        action_id: 'b:approve:K1',
+        channel: 'C0123456789',
+        message_ts: '1704067200.123456',
+        user_id: 'U_USER_456',
+        user_name: 'monica',
+      });
+
+      expect(onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          chat_jid: 'slack:C0123456789',
+          callback_data: 'b:approve:K1',
+          callback_message_id: '1704067200.123456',
+          content: '[callback] data=b:approve:K1 original_message_id=1704067200.123456',
+          is_from_me: false,
+        }),
+      );
+    });
+
+    it('drops actions from unregistered chats', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({
+        onMessage,
+        registeredGroups: vi.fn(() => ({})),
+      });
+      new SlackChannel(opts);
+
+      await triggerBlockAction({ action_id: 'a:7f3a' });
+      expect(onMessage).not.toHaveBeenCalled();
+    });
+
+    it('still emits onChatMetadata for unregistered chats (group discovery)', async () => {
+      const onChatMetadata = vi.fn();
+      const opts = createTestOpts({
+        onChatMetadata,
+        registeredGroups: vi.fn(() => ({})),
+      });
+      new SlackChannel(opts);
+
+      await triggerBlockAction({ action_id: 'a:7f3a' });
+      expect(onChatMetadata).toHaveBeenCalled();
+    });
+
+    it('resolves user real_name when available', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      await triggerBlockAction({
+        action_id: 'a:7f3a',
+        user_id: 'U_USER_456',
+        user_name: 'monica',
+      });
+
+      const delivered = onMessage.mock.calls[0][1];
+      // resolveUserName mock returns 'Alice Smith'
+      expect(delivered.sender_name).toBe('Alice Smith');
+    });
+  });
+
   // --- Constructor error handling ---
 
   describe('constructor', () => {
@@ -812,17 +1158,13 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
 
       // First page returns a cursor; second page returns no cursor
-      currentApp().client.conversations.list
-        .mockResolvedValueOnce({
-          channels: [
-            { id: 'C001', name: 'general', is_member: true },
-          ],
+      currentApp()
+        .client.conversations.list.mockResolvedValueOnce({
+          channels: [{ id: 'C001', name: 'general', is_member: true }],
           response_metadata: { next_cursor: 'cursor_page2' },
         })
         .mockResolvedValueOnce({
-          channels: [
-            { id: 'C002', name: 'random', is_member: true },
-          ],
+          channels: [{ id: 'C002', name: 'random', is_member: true }],
           response_metadata: {},
         });
 
@@ -830,7 +1172,8 @@ describe('SlackChannel', () => {
 
       // Should have called conversations.list twice (once per page)
       expect(currentApp().client.conversations.list).toHaveBeenCalledTimes(2);
-      expect(currentApp().client.conversations.list).toHaveBeenNthCalledWith(2,
+      expect(currentApp().client.conversations.list).toHaveBeenNthCalledWith(
+        2,
         expect.objectContaining({ cursor: 'cursor_page2' }),
       );
 

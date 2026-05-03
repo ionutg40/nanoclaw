@@ -1,5 +1,10 @@
 import { App, LogLevel } from '@slack/bolt';
-import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
+import type {
+  GenericMessageEvent,
+  BotMessageEvent,
+  Block,
+  KnownBlock,
+} from '@slack/types';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { updateChatName } from '../db.js';
@@ -8,6 +13,7 @@ import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
+  InlineKeyboard,
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
@@ -94,8 +100,7 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage =
-        !!msg.bot_id || msg.user === this.botUserId;
+      const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
       let senderName: string;
       if (isBotMessage) {
@@ -113,7 +118,10 @@ export class SlackChannel implements Channel {
       let content = msg.text;
       if (this.botUserId && !isBotMessage) {
         const mentionPattern = `<@${this.botUserId}>`;
-        if (content.includes(mentionPattern) && !TRIGGER_PATTERN.test(content)) {
+        if (
+          content.includes(mentionPattern) &&
+          !TRIGGER_PATTERN.test(content)
+        ) {
           content = `@${ASSISTANT_NAME} ${content}`;
         }
       }
@@ -129,6 +137,100 @@ export class SlackChannel implements Channel {
         is_bot_message: isBotMessage,
       });
     });
+
+    // ---- Block Kit button actions (inline keyboard equivalent) ----
+    //
+    // When user clicks an interactive button, Slack fires a `block_actions`
+    // payload. We must ack within 3s or Slack retries (and risks double
+    // processing). We deliver a synthetic message carrying callback_data so
+    // the agent's skill can act on it — same shape as Telegram's
+    // callback_query path.
+    this.app.action(/.*/, async ({ ack, action, body, client }) => {
+      // Ack immediately — Slack's 3s window is hard.
+      try {
+        await ack();
+      } catch (err) {
+        logger.warn({ err }, 'Slack action ack failed (non-fatal)');
+      }
+
+      // Bolt types `action` as a union; for buttons we have action_id + value.
+      const data =
+        (action as { action_id?: string; value?: string }).action_id ||
+        (action as { value?: string }).value ||
+        '';
+
+      // Defensive: body is BlockAction; channel + message + user always present
+      // for our use case (button in posted message, not modal/home tab).
+      const slackBody = body as {
+        channel?: { id?: string };
+        message?: { ts?: string };
+        user?: { id?: string; username?: string; name?: string };
+      };
+      const channelId = slackBody.channel?.id;
+      const originalMsgTs = slackBody.message?.ts;
+      const userId = slackBody.user?.id || '';
+      const userName =
+        slackBody.user?.name || slackBody.user?.username || userId || 'Unknown';
+
+      if (!channelId) {
+        logger.warn(
+          { data },
+          'Slack block_action without channel context, dropping',
+        );
+        return;
+      }
+
+      const jid = `slack:${channelId}`;
+      const timestamp = new Date().toISOString();
+
+      // Always report metadata (so unregistered chats get discovered)
+      this.opts.onChatMetadata(jid, timestamp, undefined, 'slack', true);
+
+      // Only deliver to registered groups — same gate as text messages.
+      const groups = this.opts.registeredGroups();
+      if (!groups[jid]) {
+        logger.debug(
+          { jid, data },
+          'Slack action from unregistered chat, dropping',
+        );
+        return;
+      }
+
+      // Resolve human-readable sender name (cache hit when possible)
+      let senderName = userName;
+      if (userId) {
+        const resolved = await this.resolveUserName(userId);
+        if (resolved) senderName = resolved;
+      }
+
+      // Synthetic content matches Telegram exactly so the same skill code
+      // routes both. originalMsgTs is Slack's analogue of message_id (it's
+      // the only id you can pass to chat.update / chat.delete).
+      const content = `[callback] data=${data}${
+        originalMsgTs ? ` original_message_id=${originalMsgTs}` : ''
+      }`;
+
+      this.opts.onMessage(jid, {
+        id: `${originalMsgTs || timestamp}:${data}`,
+        chat_jid: jid,
+        sender: userId,
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+        callback_data: data,
+        callback_message_id: originalMsgTs,
+      });
+
+      logger.info(
+        { jid, sender: senderName, data, originalMsgTs },
+        'Slack block_action delivered',
+      );
+
+      // Mark client unused so eslint doesn't complain — Bolt provides it but
+      // we don't need it here (we use this.app.client when needed elsewhere).
+      void client;
+    });
   }
 
   async connect(): Promise<void> {
@@ -142,10 +244,7 @@ export class SlackChannel implements Channel {
       this.botUserId = auth.user_id as string;
       logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
     } catch (err) {
-      logger.warn(
-        { err },
-        'Connected to Slack but failed to get bot user ID',
-      );
+      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
     }
 
     this.connected = true;
@@ -211,6 +310,142 @@ export class SlackChannel implements Channel {
     // no-op: Slack Bot API has no typing indicator endpoint
   }
 
+  // ---- Block Kit interactive messages ----
+
+  /**
+   * Build a Block Kit blocks array from text + an inline keyboard.
+   *
+   * Layout:
+   *   - One `section` block with the message text (mrkdwn)
+   *   - One `actions` block per keyboard row, each holding up to 25 buttons
+   *     (Slack's max). Our skill uses ≤8 per row, so we never hit the cap.
+   *
+   * `action_id` carries the callback data — Slack allows up to 255 chars,
+   * vastly more than Telegram's 64-byte limit, so any callback scheme that
+   * fits Telegram fits Slack.
+   */
+  private buildBlocks(
+    text: string,
+    keyboard: InlineKeyboard | null,
+  ): (Block | KnownBlock)[] {
+    const blocks: (Block | KnownBlock)[] = [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: text || ' ' },
+      },
+    ];
+    if (keyboard) {
+      for (const row of keyboard) {
+        if (!row.length) continue;
+        blocks.push({
+          type: 'actions',
+          elements: row.slice(0, 25).map((btn) => ({
+            type: 'button',
+            text: { type: 'plain_text', text: btn.text, emoji: true },
+            action_id: btn.callback_data,
+          })),
+        });
+      }
+    }
+    return blocks;
+  }
+
+  /**
+   * Send a message with an inline Block Kit keyboard. Returns the message's
+   * `ts` (Slack's analogue of message_id) so callers can edit/delete later.
+   */
+  async sendMessageWithKeyboard(
+    jid: string,
+    text: string,
+    keyboard: InlineKeyboard,
+  ): Promise<{ messageId: string }> {
+    const channelId = jid.replace(/^slack:/, '');
+    const blocks = this.buildBlocks(text, keyboard);
+    const result = await this.app.client.chat.postMessage({
+      channel: channelId,
+      text, // fallback for notifications + screen readers
+      blocks,
+    });
+    if (!result.ts) {
+      throw new Error('Slack chat.postMessage returned no ts');
+    }
+    logger.info(
+      { jid, messageId: result.ts, buttons: keyboard.flat().length },
+      'Slack keyboard message sent',
+    );
+    return { messageId: result.ts };
+  }
+
+  /**
+   * Edit an existing message — text, keyboard, or both.
+   *
+   * Semantics differ slightly from Telegram:
+   *   - keyboard === null: remove keyboard (text-only blocks)
+   *   - keyboard === undefined: same as null on Slack. Slack's chat.update
+   *     replaces blocks atomically; "leave keyboard unchanged" would require
+   *     fetching existing blocks first, which adds an API call per edit and
+   *     complicates rate-limiting. The grade-review skill never passes
+   *     undefined in practice, so we accept the simplification.
+   *   - keyboard array: replace keyboard
+   */
+  async editMessage(
+    jid: string,
+    messageId: string,
+    text: string,
+    keyboard?: InlineKeyboard | null,
+  ): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+    const blocks = this.buildBlocks(text, keyboard ?? null);
+    try {
+      await this.app.client.chat.update({
+        channel: channelId,
+        ts: messageId,
+        text,
+        blocks,
+      });
+      logger.info({ jid, messageId }, 'Slack message edited');
+    } catch (err: unknown) {
+      const errMsg = (err as { data?: { error?: string }; message?: string })
+        ?.data?.error || (err as { message?: string })?.message || String(err);
+      // message_not_found / cant_update_message / edit_window_closed are
+      // non-fatal — log and move on. Other errors propagate so callers see them.
+      if (
+        errMsg === 'message_not_found' ||
+        errMsg === 'cant_update_message' ||
+        errMsg === 'edit_window_closed'
+      ) {
+        logger.debug(
+          { jid, messageId, errMsg },
+          'Slack editMessage non-fatal failure',
+        );
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Delete a message by ts. Bot can only delete messages it sent. Silent on
+   * "already gone" errors so callers don't have to handle them.
+   */
+  async deleteMessage(jid: string, messageId: string): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+    try {
+      await this.app.client.chat.delete({
+        channel: channelId,
+        ts: messageId,
+      });
+      logger.info({ jid, messageId }, 'Slack message deleted');
+    } catch (err: unknown) {
+      const errMsg = (err as { data?: { error?: string }; message?: string })
+        ?.data?.error || (err as { message?: string })?.message || String(err);
+      logger.debug(
+        { jid, messageId, errMsg },
+        'Slack deleteMessage non-fatal failure',
+      );
+    }
+  }
+
   /**
    * Sync channel metadata from Slack.
    * Fetches channels the bot is a member of and stores their names in the DB.
@@ -245,9 +480,7 @@ export class SlackChannel implements Channel {
     }
   }
 
-  private async resolveUserName(
-    userId: string,
-  ): Promise<string | undefined> {
+  private async resolveUserName(userId: string): Promise<string | undefined> {
     if (!userId) return undefined;
 
     const cached = this.userNameCache.get(userId);
