@@ -56,7 +56,15 @@ export class TelegramChannel implements Channel {
   // Chat JIDs this bot has seen inbound. Populated on every message — grammy
   // polls per bot token, so a chat that reaches THIS bot is definitively owned
   // by THIS instance. Used by ownsJid for outbound routing.
+  //
+  // Capped LRU: at any given time the bot really only needs ownership info for
+  // chats with recent traffic. Without a cap, this Set grows monotonically
+  // (every chat the bot was ever DM'd by an attacker / spammer / random user
+  // sticks around forever), turning into a slow memory leak in long-running
+  // deployments. Set preserves insertion order, so re-inserting on hit moves
+  // the entry to the end and the first key is always the least-recently-seen.
   private knownChats: Set<string> = new Set();
+  private static readonly KNOWN_CHATS_LIMIT = 5000;
 
   // Per-bot identity used in /ping replies and possibly other surface text.
   // Defaults to the global ASSISTANT_NAME so existing bots keep their behavior.
@@ -137,7 +145,7 @@ export class TelegramChannel implements Channel {
     // Command to get chat ID (useful for registration)
     this.bot.command('chatid', (ctx) => {
       const chatId = ctx.chat.id;
-      this.knownChats.add(`tg:${chatId}`);
+      this.rememberChat(`tg:${chatId}`);
       const chatType = ctx.chat.type;
       const chatName =
         chatType === 'private'
@@ -152,7 +160,7 @@ export class TelegramChannel implements Channel {
 
     // Command to check bot status
     this.bot.command('ping', (ctx) => {
-      this.knownChats.add(`tg:${ctx.chat.id}`);
+      this.rememberChat(`tg:${ctx.chat.id}`);
       ctx.reply(`${this.assistantLabel} is online (${this.name}).`);
     });
 
@@ -169,7 +177,7 @@ export class TelegramChannel implements Channel {
       const chatJid = `tg:${ctx.chat.id}`;
       // Claim ownership: this bot received a message from chatJid,
       // so future outbound to that JID must route through THIS instance.
-      this.knownChats.add(chatJid);
+      this.rememberChat(chatJid);
       let content = ctx.message.text;
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
       const senderName =
@@ -267,7 +275,7 @@ export class TelegramChannel implements Channel {
     ) => {
       const chatJid = `tg:${ctx.chat.id}`;
       // Claim ownership on any inbound media from this chat too.
-      this.knownChats.add(chatJid);
+      this.rememberChat(chatJid);
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
 
@@ -383,7 +391,7 @@ export class TelegramChannel implements Channel {
         return;
       }
       const chatJid = `tg:${chat.id}`;
-      this.knownChats.add(chatJid);
+      this.rememberChat(chatJid);
 
       const data = ctx.callbackQuery.data;
       const originalMsg = ctx.callbackQuery.message;
@@ -507,10 +515,31 @@ export class TelegramChannel implements Channel {
     return this.bot !== null;
   }
 
+  // Bounded add: evict least-recently-seen JID when at capacity. Set preserves
+  // insertion order, so the first key is the oldest entry.
+  private rememberChat(jid: string): void {
+    if (this.knownChats.has(jid)) {
+      this.knownChats.delete(jid); // refresh recency
+      this.knownChats.add(jid);
+      return;
+    }
+    if (this.knownChats.size >= TelegramChannel.KNOWN_CHATS_LIMIT) {
+      const oldest = this.knownChats.values().next().value;
+      if (oldest) this.knownChats.delete(oldest);
+    }
+    this.knownChats.add(jid);
+  }
+
   ownsJid(jid: string): boolean {
     if (!jid.startsWith('tg:')) return false;
     // A chat this bot has seen inbound is definitively ours.
-    if (this.knownChats.has(jid)) return true;
+    if (this.knownChats.has(jid)) {
+      // LRU touch: re-insert to refresh recency, so a chat we still talk with
+      // doesn't get evicted just because we've also seen many other chats.
+      this.knownChats.delete(jid);
+      this.knownChats.add(jid);
+      return true;
+    }
     // Legacy/fallback instance catches any tg: JID we haven't yet seen.
     // Non-fallback instances (new bots) strictly own only what they've observed.
     return this.isFallback;

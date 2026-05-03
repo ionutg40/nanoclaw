@@ -16,11 +16,38 @@ const FULL_RESET = '\x1b[0m';
 const threshold =
   LEVELS[(process.env.LOG_LEVEL as Level) || 'info'] ?? LEVELS.info;
 
+// Redact obvious credential shapes from any string before it lands in logs.
+// Slack bot/app/user tokens (`xoxb-…`, `xapp-…`, `xoxa-…`, `xoxp-…`, `xoxs-…`),
+// Anthropic API keys (`sk-ant-…`), and Bearer headers all leak through Bolt's
+// WebAPIRequestError.stack JSON because Slack's SDK historically attaches the
+// raw axios `config.headers.Authorization` to the rejected promise. Anyone
+// with read access to journald/launchd would otherwise pull the bot token out
+// of a single transient TLS error.
+const CREDENTIAL_PATTERNS: Array<RegExp> = [
+  // Slack workspace, bot, app, user, refresh, signing tokens.
+  /xox[abprs]-[A-Za-z0-9-]+/g,
+  // Slack app-level token (different prefix than xoxX family).
+  /xapp-[A-Za-z0-9-]+/g,
+  // Anthropic API + OAuth tokens.
+  /sk-ant-[A-Za-z0-9_-]+/g,
+  // Bearer Authorization header values.
+  /Bearer\s+[A-Za-z0-9._-]+/gi,
+];
+function redactCredentials(s: string): string {
+  let out = s;
+  for (const re of CREDENTIAL_PATTERNS) out = out.replace(re, '[REDACTED]');
+  return out;
+}
+
 function formatErr(err: unknown): string {
   if (err instanceof Error) {
-    return `{\n      "type": "${err.constructor.name}",\n      "message": "${err.message}",\n      "stack":\n          ${err.stack}\n    }`;
+    const msg = redactCredentials(err.message ?? '');
+    const stack = redactCredentials(err.stack ?? '');
+    return `{\n      "type": "${err.constructor.name}",\n      "message": "${msg}",\n      "stack":\n          ${stack}\n    }`;
   }
-  return JSON.stringify(err);
+  // Stringify-then-redact catches plain-object errors like Bolt's
+  // WebAPIRequestError, whose interesting fields are nested.
+  return redactCredentials(JSON.stringify(err) ?? '');
 }
 
 function formatData(data: Record<string, unknown>): string {
@@ -29,7 +56,7 @@ function formatData(data: Record<string, unknown>): string {
     if (k === 'err') {
       out += `\n    ${KEY_COLOR}err${RESET}: ${formatErr(v)}`;
     } else {
-      out += `\n    ${KEY_COLOR}${k}${RESET}: ${JSON.stringify(v)}`;
+      out += `\n    ${KEY_COLOR}${k}${RESET}: ${redactCredentials(JSON.stringify(v) ?? '')}`;
     }
   }
   return out;

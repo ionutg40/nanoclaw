@@ -481,4 +481,44 @@ describe('GroupQueue', () => {
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
   });
+
+  // --- Idle GroupState pruning ---
+
+  it('drops GroupState after idle drain so the Map does not grow unboundedly', async () => {
+    const processMessages = vi.fn(async () => true);
+    queue.setProcessMessagesFn(processMessages);
+
+    queue.enqueueMessageCheck('chat:1');
+    await vi.advanceTimersByTimeAsync(50);
+    queue.enqueueMessageCheck('chat:2');
+    await vi.advanceTimersByTimeAsync(50);
+    queue.enqueueMessageCheck('chat:3');
+    await vi.advanceTimersByTimeAsync(50);
+
+    // After draining each, the GroupQueue's internal `groups` Map should
+    // have been swept clean — no per-chat state lingers when there's no
+    // pending work.
+    const groupsRef = (queue as unknown as { groups: Map<string, unknown> })
+      .groups;
+    expect(groupsRef.size).toBe(0);
+  });
+
+  it('keeps GroupState while a retry is still scheduled', async () => {
+    let calls = 0;
+    const processMessages = vi.fn(async () => {
+      calls++;
+      // First call fails so scheduleRetry kicks in (retryCount becomes 1).
+      return calls > 1;
+    });
+    queue.setProcessMessagesFn(processMessages);
+
+    queue.enqueueMessageCheck('chat:retry');
+    await vi.advanceTimersByTimeAsync(50);
+
+    // Group must NOT be pruned while retryCount > 0 — pruning would reset the
+    // backoff to 0 and defeat MAX_RETRIES on the next attempt.
+    const groupsRef = (queue as unknown as { groups: Map<string, unknown> })
+      .groups;
+    expect(groupsRef.has('chat:retry')).toBe(true);
+  });
 });

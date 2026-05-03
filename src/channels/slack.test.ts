@@ -1268,6 +1268,115 @@ describe('SlackChannel', () => {
       expect(onMessage).not.toHaveBeenCalled();
       expect(fetchMock).not.toHaveBeenCalled();
     });
+
+    it('rejects file larger than MAX_FILE_BYTES (size from files.info)', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // 26 MB — exceeds 25 MB cap. files.info advertises size; downloadFile
+      // should refuse to fetch the body, returning the no-path placeholder.
+      currentApp().client.files.info.mockResolvedValueOnce({
+        ok: true,
+        file: {
+          id: 'F0BIG',
+          name: 'huge.csv',
+          url_private_download:
+            'https://files.slack.com/files-pri/T0/F0BIG/download/huge.csv',
+          size: 26 * 1024 * 1024,
+        },
+      });
+
+      const handler = currentApp().eventHandlers.get('message');
+      await handler({
+        event: {
+          channel: 'C0123456789',
+          channel_type: 'channel',
+          user: 'U_USER_456',
+          text: '',
+          ts: '1.0',
+          files: [{ id: 'F0BIG', name: 'huge.csv' }],
+        },
+      });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      const delivered = onMessage.mock.calls[0][1];
+      expect(delivered.content).toContain('[Document: huge.csv]');
+      expect(delivered.content).not.toContain('/workspace/group');
+    });
+
+    it('rejects file with disallowed mimetype', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.files.info.mockResolvedValueOnce({
+        ok: true,
+        file: {
+          id: 'F0EXE',
+          name: 'tool.exe',
+          url_private_download:
+            'https://files.slack.com/files-pri/T0/F0EXE/download/tool.exe',
+          mimetype: 'application/x-msdownload',
+        },
+      });
+
+      const handler = currentApp().eventHandlers.get('message');
+      await handler({
+        event: {
+          channel: 'C0123456789',
+          channel_type: 'channel',
+          user: 'U_USER_456',
+          text: '',
+          ts: '1.0',
+          files: [{ id: 'F0EXE', name: 'tool.exe' }],
+        },
+      });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      const delivered = onMessage.mock.calls[0][1];
+      expect(delivered.content).toContain('[Document: tool.exe]');
+      expect(delivered.content).not.toContain('/workspace/group');
+    });
+
+    it('accepts known CSV mimetypes (text/csv, vnd.ms-excel, plain)', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.files.info.mockResolvedValueOnce({
+        ok: true,
+        file: {
+          id: 'F0VND',
+          name: 'export.csv',
+          url_private_download:
+            'https://files.slack.com/files-pri/T0/F0VND/download/export.csv',
+          mimetype: 'application/vnd.ms-excel',
+          size: 200,
+        },
+      });
+
+      const handler = currentApp().eventHandlers.get('message');
+      await handler({
+        event: {
+          channel: 'C0123456789',
+          channel_type: 'channel',
+          user: 'U_USER_456',
+          text: '',
+          ts: '1.0',
+          files: [{ id: 'F0VND', name: 'export.csv' }],
+        },
+      });
+
+      expect(fetchMock).toHaveBeenCalled();
+      const delivered = onMessage.mock.calls[0][1];
+      expect(delivered.content).toContain(
+        '/workspace/group/attachments/export.csv',
+      );
+    });
   });
 
   describe('Markdown translation (Telegram MD → Slack mrkdwn)', () => {

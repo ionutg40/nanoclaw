@@ -311,7 +311,24 @@ export class GroupQueue {
       return;
     }
 
-    // Nothing pending for this group; check if other groups are waiting for a slot
+    // Nothing pending for this group. Drop the GroupState entry to avoid
+    // long-running daemons accumulating one entry per chatJid ever seen
+    // (deregistered groups, stale task chat_jids, transient JIDs surface
+    // here too). Only safe to delete when there's truly no work — and no
+    // pending retry counter, since scheduleRetry's setTimeout will re-enter
+    // via enqueueMessageCheck and getGroup auto-creates a fresh state with
+    // retryCount=0, which would defeat the backoff cap.
+    if (
+      !state.active &&
+      state.pendingTasks.length === 0 &&
+      !state.pendingMessages &&
+      state.retryCount === 0 &&
+      state.runningTaskId === null
+    ) {
+      this.groups.delete(groupJid);
+    }
+
+    // Check if other groups are waiting for a slot
     this.drainWaiting();
   }
 

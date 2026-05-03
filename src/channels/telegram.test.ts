@@ -1156,4 +1156,78 @@ describe('TelegramChannel', () => {
       expect(channel.name).toBe('telegram');
     });
   });
+
+  describe('knownChats LRU bound', () => {
+    it('caps the Set at KNOWN_CHATS_LIMIT and evicts oldest', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const knownRef = (channel as unknown as { knownChats: Set<string> })
+        .knownChats;
+      const handler = currentBot().commandHandlers.get('chatid')!;
+
+      // Drive 5001 distinct /chatid invocations — each calls rememberChat
+      // via the public command handler. After the 5001st, the first JID
+      // (chat 0) must have been evicted; the last (chat 5000) must remain.
+      for (let i = 0; i < 5001; i++) {
+        await handler({
+          chat: { id: i, type: 'private' as const },
+          from: { first_name: 'X' },
+          reply: vi.fn(),
+        });
+      }
+
+      expect(knownRef.size).toBeLessThanOrEqual(5000);
+      expect(knownRef.has('tg:0')).toBe(false);
+      expect(knownRef.has('tg:5000')).toBe(true);
+    });
+
+    it('refreshes recency on ownsJid hit so re-touched JIDs survive churn', async () => {
+      const opts = createTestOpts();
+      // Non-fallback so ownsJid actually consults the Set rather than
+      // returning true unconditionally.
+      const channel = new TelegramChannel(
+        'test-token',
+        opts,
+        'telegram-secondary',
+        false,
+      );
+      await channel.connect();
+
+      const knownRef = (channel as unknown as { knownChats: Set<string> })
+        .knownChats;
+      const handler = currentBot().commandHandlers.get('chatid')!;
+
+      // Seed JID 0 first.
+      await handler({
+        chat: { id: 0, type: 'private' as const },
+        from: { first_name: 'X' },
+        reply: vi.fn(),
+      });
+
+      // Add 4999 more JIDs; total = 5000 (cap).
+      for (let i = 1; i < 5000; i++) {
+        await handler({
+          chat: { id: i, type: 'private' as const },
+          from: { first_name: 'X' },
+          reply: vi.fn(),
+        });
+      }
+      expect(knownRef.has('tg:0')).toBe(true);
+
+      // Touch JID 0 via ownsJid — moves it to the end (most recent).
+      expect(channel.ownsJid('tg:0')).toBe(true);
+
+      // One more JID pushes us over the cap; oldest entry now is 'tg:1',
+      // not 'tg:0' (which was just touched).
+      await handler({
+        chat: { id: 9999, type: 'private' as const },
+        from: { first_name: 'X' },
+        reply: vi.fn(),
+      });
+      expect(knownRef.has('tg:0')).toBe(true);
+      expect(knownRef.has('tg:1')).toBe(false);
+    });
+  });
 });
