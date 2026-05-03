@@ -71,6 +71,7 @@ On callback message arrival:
 
     "b:<group>:<token>":
        group_state = state.groups[token]
+       actor = normalize_actor(trigger.sender_name)  # see SKILL.md "Actor attribution"
        for short_id in group_state.short_ids:
          dec = state.decisions[short_id]
          if dec.decision == "needs_review": continue   # never auto
@@ -78,7 +79,7 @@ On callback message arrival:
                   "correct" if dec.decision=="correct" else
                   "bounce"   if dec.decision=="bounce_back" else None
          if action:
-           run bot_cli.py submit --id <dec.submission_id> --action <action>
+           run bot_cli.py submit --id <dec.submission_id> --action <action> --actor <actor>
                                   [--nha-score <dec.nha_score> if action=="correct"]
            tally success/error in state.counts
 
@@ -90,12 +91,15 @@ On callback message arrival:
 
     "<a>:<short_id>":
        dec = state.decisions[short_id]
+       actor = normalize_actor(trigger.sender_name)  # vezi SKILL.md
        action_map = {"a":"approve", "c":"correct", "x":"bounce"}
        if a in action_map:
-         run submit
+         run bot_cli.py submit --id <dec.submission_id> --action <action_map[a]> --actor <actor>
+                                [--nha-score <dec.nha_score> if action_map[a]=="correct"]
          edit_message(state.messages.individuals[short_id], status, keyboard=null)
        elif a == "s":
-         # skip — no submit, just acknowledge
+         # skip — audit row only, no LW call
+         run bot_cli.py submit --id <dec.submission_id> --action skip --actor <actor>
          edit_message(state.messages.individuals[short_id], "_Skipped_", keyboard=null)
          state.counts.skipped++
        elif a == "d":

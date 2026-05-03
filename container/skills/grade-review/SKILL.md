@@ -47,15 +47,17 @@ Load `session_state.json`, then route per `${CLAUDE_SKILL_DIR}/callback_routing.
 
 | Code pattern | Action |
 |---|---|
-| `b:<group>:<token>` | For each `short_id` in `groups[token].short_ids`: run `bot_cli.py submit --id <full_id> --action <approve\|correct\|bounce> [--nha-score N]`. Then `edit_message` to status + `keyboard: null`. Show progress edits every 5+ submissions. |
+| `b:<group>:<token>` | For each `short_id` in `groups[token].short_ids`: run `bot_cli.py submit --id <full_id> --action <approve\|correct\|bounce> --actor <sender> [--nha-score N]`. Then `edit_message` to status + `keyboard: null`. Show progress edits every 5+ submissions. |
 | `r:<group>:<token>` | Render the first individual card from that group (template in `formatters.md`). |
-| `a:<sid>` / `c:<sid>` / `x:<sid>` | Single submit, then `edit_message` to status. |
-| `s:<sid>` | Skip — run `bot_cli.py submit --id <full_id> --action skip` (writes audit row, no LW call). Then `edit_message` to "_Skipped_", `keyboard: null`. |
+| `a:<sid>` / `c:<sid>` / `x:<sid>` | Single submit (`--actor <sender>`), then `edit_message` to status. |
+| `s:<sid>` | Skip — run `bot_cli.py submit --id <full_id> --action skip --actor <sender>` (writes audit row, no LW call). Then `edit_message` to "_Skipped_", `keyboard: null`. |
 | `d:<sid>` | Show full details (PII allowed only here). Add `[← Back]` button → `back:<sid>`. |
 | `back:<sid>` / `back:summary` | Restore the previous view. |
 | `end` | Send session-close summary and clear `session_state.json`. |
 
 For exact message templates and PII-minimization rules, see `${CLAUDE_SKILL_DIR}/formatters.md`.
+
+**Actor attribution** (`--actor <sender>`): the sender of the callback message arrives in the trigger context as `<message sender="...">`. Pass this to every `bot_cli.py submit` invocation as `--actor`. Normalize: lowercase, replace spaces with `_`, strip non-alphanumeric except `_`. Examples: `"Monica Garcia"` → `monica_garcia`, `"rekon"` → `rekon`, `"R.T. Arnold"` → `rt_arnold`. This lets the audit log record who-graded-what across the shared CapYear group (Monica + Alberto + rekon + fasty).
 
 ## CLI commands
 
