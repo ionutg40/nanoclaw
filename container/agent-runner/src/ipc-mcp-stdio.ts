@@ -48,7 +48,7 @@ server.tool(
       .string()
       .optional()
       .describe(
-        'Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.',
+        'Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot (Telegram-specific feature; ignored on other channels).',
       ),
   },
   async (args) => {
@@ -69,7 +69,7 @@ server.tool(
 
 server.tool(
   'send_message_with_keyboard',
-  `Send a message with an inline keyboard (interactive buttons). Only works on Telegram. Each button has a \`text\` label and a \`callback_data\` string (max 64 bytes) that comes back as a message to you when the user taps.
+  `Send a message with an inline keyboard (interactive buttons). Works on both Telegram (inline keyboard) and Slack (Block Kit actions). Each button has a \`text\` label and a \`callback_data\` string (max 64 bytes — Telegram's hard cap; Slack accepts up to 255 but using one budget keeps callbacks portable) that comes back as a message to you when the user taps.
 
 Keyboard shape: \`[[ {text, callback_data}, {text, callback_data} ], [ {text, callback_data} ]]\` — outer array is rows, inner is buttons per row.
 
@@ -122,13 +122,15 @@ When the user taps a button, you receive a message with \`[callback] data=<value
 
 server.tool(
   'delete_message',
-  `Delete a message you sent earlier (Telegram only, 48h window). Use to remove decision prompts with PII after the operator has acted on them — keeps the chat clean and minimizes how long student names/scores sit in Telegram's cloud.
+  `Delete a message you sent earlier. Works on Telegram (48h window from send time) and Slack (no time limit for bot-owned messages). Use to remove decision prompts with PII after the operator has acted on them — keeps the chat clean and minimizes how long student names/scores sit in the platform's cloud.
 
-Fails silently if the message is >48h old or already deleted. If you're past the 48h window and really need the message gone, edit_message it to something minimal instead.`,
+Fails silently if the message is gone or out of edit window. If you're past Telegram's 48h window and really need the message gone, edit_message it to something minimal instead.`,
   {
     messageId: z
       .string()
-      .describe('Platform message id (Telegram message_id as string).'),
+      .describe(
+        'Platform message id (Telegram message_id as string, or Slack ts like "1704067200.000000").',
+      ),
   },
   async (args) => {
     const data = {
@@ -154,7 +156,7 @@ You need the messageId from when the message was sent. For plain send_message th
     messageId: z
       .string()
       .describe(
-        'Platform message id (Telegram message_id as string). Available after send_message_with_keyboard completes.',
+        'Platform message id (Telegram message_id, or Slack ts). Available after send_message_with_keyboard completes.',
       ),
     text: z.string().describe('The new text to replace the current message with'),
     keyboard: z
