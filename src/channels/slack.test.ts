@@ -61,6 +61,17 @@ vi.mock('@slack/bolt', () => ({
           user: { real_name: 'Alice Smith', name: 'alice' },
         }),
       },
+      files: {
+        info: vi.fn().mockResolvedValue({
+          ok: true,
+          file: {
+            id: 'F0TEST',
+            name: 'NHA_Detailed_Report.CSV',
+            url_private_download:
+              'https://files.slack.com/files-pri/T0/F0TEST/download/test.csv',
+          },
+        }),
+      },
     };
 
     constructor(opts: any) {
@@ -94,6 +105,29 @@ vi.mock('../env.js', () => ({
     SLACK_APP_TOKEN: 'xapp-test-token',
   }),
 }));
+
+// Mock group-folder helper (resolves group folder to absolute path on host)
+vi.mock('../group-folder.js', () => ({
+  resolveGroupFolderPath: vi.fn(
+    (folder: string) => `/tmp/test-groups/${folder}`,
+  ),
+  isValidGroupFolder: vi.fn(() => true),
+}));
+
+// Mock global fetch for file download
+const fetchMock = vi.fn();
+vi.stubGlobal('fetch', fetchMock);
+
+// Mock fs for file write (we don't want real I/O in tests)
+vi.mock('fs', async (orig) => {
+  const actual = (await orig()) as typeof import('fs');
+  return {
+    ...actual,
+    mkdirSync: vi.fn(),
+    writeFileSync: vi.fn(),
+    default: { ...actual, mkdirSync: vi.fn(), writeFileSync: vi.fn() },
+  };
+});
 
 import { SlackChannel, SlackChannelOpts } from './slack.js';
 import { updateChatName } from '../db.js';
@@ -1093,6 +1127,149 @@ describe('SlackChannel', () => {
     });
   });
 
+  describe('file_share / files attached to message', () => {
+    beforeEach(() => {
+      fetchMock.mockReset();
+      fetchMock.mockResolvedValue({
+        ok: true,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(100)),
+      });
+    });
+
+    it('downloads file and emits [Document: name] (path) marker', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const handler = currentApp().eventHandlers.get('message');
+      await handler({
+        event: {
+          channel: 'C0123456789',
+          channel_type: 'channel',
+          user: 'U_USER_456',
+          text: '',
+          ts: '1.0',
+          files: [{ id: 'F0TEST', name: 'NHA_Detailed_Report.CSV' }],
+        },
+      });
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://files.slack.com/files-pri/T0/F0TEST/download/test.csv',
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            Authorization: 'Bearer xoxb-test-token',
+          }),
+        }),
+      );
+      expect(onMessage).toHaveBeenCalledTimes(1);
+      const delivered = onMessage.mock.calls[0][1];
+      expect(delivered.content).toContain(
+        '[Document: NHA_Detailed_Report.CSV]',
+      );
+      expect(delivered.content).toContain(
+        '/workspace/group/attachments/NHA_Detailed_Report.CSV',
+      );
+    });
+
+    it('appends file marker to text when message has both', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const handler = currentApp().eventHandlers.get('message');
+      await handler({
+        event: {
+          channel: 'C0123456789',
+          channel_type: 'channel',
+          user: 'U_USER_456',
+          text: 'Latest CSV',
+          ts: '1.0',
+          files: [{ id: 'F0TEST', name: 'NHA_Detailed_Report.CSV' }],
+        },
+      });
+      const delivered = onMessage.mock.calls[0][1];
+      expect(delivered.content).toMatch(
+        /^Latest CSV\n\[Document: NHA_Detailed_Report\.CSV\]/,
+      );
+    });
+
+    it('emits placeholder when download fails', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Force download failure: files.info returns no url_private_download
+      currentApp().client.files.info.mockResolvedValueOnce({
+        ok: true,
+        file: { id: 'F0X', name: 'lost.csv' },
+      });
+
+      const handler = currentApp().eventHandlers.get('message');
+      await handler({
+        event: {
+          channel: 'C0123456789',
+          channel_type: 'channel',
+          user: 'U_USER_456',
+          text: '',
+          ts: '1.0',
+          files: [{ id: 'F0X', name: 'lost.csv' }],
+        },
+      });
+      const delivered = onMessage.mock.calls[0][1];
+      // Falls back to a marker without path so the agent still sees something
+      expect(delivered.content).toContain('[Document: lost.csv]');
+      expect(delivered.content).not.toContain('/workspace/group');
+    });
+
+    it('does NOT download files for bot-sent messages (avoid recursion)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const handler = currentApp().eventHandlers.get('message');
+      await handler({
+        event: {
+          channel: 'C0123456789',
+          channel_type: 'channel',
+          user: 'U_BOT_123', // bot's own user id
+          text: '',
+          ts: '1.0',
+          files: [{ id: 'F0TEST', name: 'test.csv' }],
+        },
+      });
+
+      // fetch should NOT have been called
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('drops files event from unregistered channel', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({
+        onMessage,
+        registeredGroups: vi.fn(() => ({})),
+      });
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const handler = currentApp().eventHandlers.get('message');
+      await handler({
+        event: {
+          channel: 'C0123456789',
+          channel_type: 'channel',
+          user: 'U_USER_456',
+          text: '',
+          ts: '1.0',
+          files: [{ id: 'F0TEST', name: 'test.csv' }],
+        },
+      });
+      expect(onMessage).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Markdown translation (Telegram MD → Slack mrkdwn)', () => {
     it('translates **bold** to *bold*', async () => {
       const opts = createTestOpts();
@@ -1292,11 +1469,9 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
       const longLabel = 'X'.repeat(100);
-      await channel.sendMessageWithKeyboard(
-        'slack:C0123456789',
-        'Pick:',
-        [[{ text: longLabel, callback_data: 'a' }]],
-      );
+      await channel.sendMessageWithKeyboard('slack:C0123456789', 'Pick:', [
+        [{ text: longLabel, callback_data: 'a' }],
+      ]);
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
       const btnText = call.blocks[1].elements[0].text.text;
       expect(btnText.length).toBeLessThanOrEqual(75);
@@ -1308,11 +1483,9 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
       const longCallback = 'a:' + 'x'.repeat(300);
-      await channel.sendMessageWithKeyboard(
-        'slack:C0123456789',
-        'Pick:',
-        [[{ text: 'OK', callback_data: longCallback }]],
-      );
+      await channel.sendMessageWithKeyboard('slack:C0123456789', 'Pick:', [
+        [{ text: 'OK', callback_data: longCallback }],
+      ]);
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
       const actionId = call.blocks[1].elements[0].action_id;
       expect(actionId.length).toBeLessThanOrEqual(255);
@@ -1342,11 +1515,9 @@ describe('SlackChannel', () => {
         text: `B${i}`,
         callback_data: `a:${i}`,
       }));
-      await channel.sendMessageWithKeyboard(
-        'slack:C0123456789',
-        'Pick:',
-        [row],
-      );
+      await channel.sendMessageWithKeyboard('slack:C0123456789', 'Pick:', [
+        row,
+      ]);
       const call = currentApp().client.chat.postMessage.mock.calls[0][0];
       expect(call.blocks[1].elements.length).toBe(25);
     });
