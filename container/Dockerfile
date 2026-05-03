@@ -77,7 +77,13 @@ RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/
 # Container input (prompt, group info) is passed via stdin JSON.
 # Credentials are injected by the host's credential proxy — never passed here.
 # Follow-up messages arrive via IPC files in /workspace/ipc/input/
-RUN printf '#!/bin/bash\nset -e\ncat > /tmp/input.json\nnode /app/dist/index.js < /tmp/input.json\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+# umask 0077 ensures any files the agent writes (session_state.json, audit
+# rows via skills, scratch files in /workspace/group/) inherit 0600 / 0700
+# perms by default. Mounted host dirs that contain PII (audit.jsonl,
+# decisions_cache.json) already chmod 0600 explicitly, but this catches
+# all the paths that don't — defense in depth so the host's group folder
+# isn't world-readable just because the agent forgot to set a mode.
+RUN printf '#!/bin/bash\nset -e\numask 0077\ncat > /tmp/input.json\nnode /app/dist/index.js < /tmp/input.json\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace && chmod 777 /home/node

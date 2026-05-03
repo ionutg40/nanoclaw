@@ -2086,10 +2086,14 @@ describe('SlackChannel', () => {
         }
       ).outgoingQueue;
       expect(internalQueue.length).toBeLessThanOrEqual(500);
-      // Oldest dropped: message msg-0 should not be in queue anymore
+      // FIFO drop: pushed 510, cap 500, so oldest 10 (msg-0..msg-9) are gone
+      // and msg-10..msg-509 remain in insertion order. Strictly assert the
+      // ordering — a previous bug where the drop logic kept "newest only by
+      // luck" would still satisfy a toBeDefined check on msg-509 alone.
+      expect(internalQueue[0].text).toBe('msg-10');
+      expect(internalQueue[internalQueue.length - 1].text).toBe('msg-509');
       expect(internalQueue.find((m) => m.text === 'msg-0')).toBeUndefined();
-      // Newest preserved: msg-509 should be in queue
-      expect(internalQueue.find((m) => m.text === 'msg-509')).toBeDefined();
+      expect(internalQueue.find((m) => m.text === 'msg-9')).toBeUndefined();
     });
   });
 
