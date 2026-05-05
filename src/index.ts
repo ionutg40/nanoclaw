@@ -12,7 +12,11 @@ import {
   MAX_MESSAGES_PER_PROMPT,
   ONECLI_URL,
   POLL_INTERVAL,
+  SILENCE_ACK_MESSAGES,
+  SILENCE_ACK_MESSAGES_BY_CHANNEL,
+  SILENCE_ACK_MS,
   TIMEZONE,
+  TYPING_REFRESH_MS,
 } from './config.js';
 import './channels/index.js';
 import {
@@ -280,8 +284,70 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+  // Lightweight ack on the most recent inbound message — like the UrbanDigs
+  // Slack bot's "I see you" pattern. Channels without reactions (Telegram in
+  // its current adapter) silently no-op via optional chaining. Fire-and-forget
+  // so a Slack hiccup never blocks the agent run.
+  const latestInbound = missedMessages[missedMessages.length - 1];
+  if (latestInbound?.id && !latestInbound.is_from_me) {
+    channel
+      .addReaction?.(chatJid, latestInbound.id, 'eyes')
+      ?.catch((err) =>
+        logger.debug({ chatJid, err }, 'Failed to add reaction'),
+      );
+    // Anchor outbound replies to a thread off the triggering message itself
+    // — each new user message gets its own thread, so debugging stays
+    // self-contained per question. If the user happened to post inside an
+    // existing Slack thread, Slack normalizes our `thread_ts` back to that
+    // parent thread (sub-threads aren't a thing on the platform), which is
+    // a graceful fallback rather than a wrong target.
+    channel.setActiveThread?.(chatJid, latestInbound.id);
+  }
   let hadError = false;
   let outputSentToUser = false;
+
+  // Programmatic activity feedback. Telegram's typing action expires after ~5s
+  // and the LLM's send_message ack is probabilistic, so the host owns these:
+  //  - typingTimer: re-arms the typing indicator until output lands
+  //  - silenceAckTimer: if no output reaches the user before SILENCE_ACK_MS,
+  //    sends SILENCE_ACK_MESSAGE so the chat never looks frozen
+  // Both clear as soon as the first user-visible output is sent OR processing
+  // ends (success/error). Disabled by setting their MS values to 0.
+  const typingTimer =
+    TYPING_REFRESH_MS > 0
+      ? setInterval(() => {
+          channel
+            .setTyping?.(chatJid, true)
+            ?.catch((err) =>
+              logger.debug(
+                { chatJid, err },
+                'Failed to refresh typing indicator',
+              ),
+            );
+        }, TYPING_REFRESH_MS)
+      : null;
+
+  // Pick the channel-appropriate ack pool: Slack workspaces want English,
+  // Telegram (Taskmaster) keeps the Romanian defaults.
+  const ackPool =
+    SILENCE_ACK_MESSAGES_BY_CHANNEL[channel.name] || SILENCE_ACK_MESSAGES;
+  let silenceAckTimer: ReturnType<typeof setTimeout> | null = null;
+  if (SILENCE_ACK_MS > 0 && ackPool.length > 0) {
+    silenceAckTimer = setTimeout(() => {
+      if (!outputSentToUser) {
+        const msg = ackPool[Math.floor(Math.random() * ackPool.length)];
+        channel
+          .sendMessage(chatJid, msg)
+          .catch((err) =>
+            logger.warn(
+              { chatJid, err },
+              'Failed to send silence-ack message',
+            ),
+          );
+      }
+      silenceAckTimer = null;
+    }, SILENCE_ACK_MS);
+  }
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -296,6 +362,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (text) {
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
+        // First real output reached the user — cancel the silence-ack fallback
+        // (we no longer need to insert "Lucrez...") but keep refreshing typing
+        // because the agent may still be working on follow-up output.
+        if (silenceAckTimer) {
+          clearTimeout(silenceAckTimer);
+          silenceAckTimer = null;
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -310,7 +383,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
+  if (typingTimer) clearInterval(typingTimer);
+  if (silenceAckTimer) clearTimeout(silenceAckTimer);
   await channel.setTyping?.(chatJid, false);
+  // Release the thread anchor so post-run messages (scheduled tasks,
+  // remote-control outputs) land at channel root again.
+  channel.clearActiveThread?.(chatJid);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -533,6 +611,21 @@ async function startMessageLoop(): Promise<void> {
               ?.catch((err) =>
                 logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
               );
+            // Hot-path twin of the cold-path ack/anchor in processGroupMessages:
+            // when a message is piped into a still-running container, the
+            // orchestrator never re-enters processGroupMessages, so the eyes
+            // reaction and the per-message thread anchor must be applied here
+            // too. Without this, every reply for a long-lived container kept
+            // collapsing into the first message's thread.
+            const latestPiped = messagesToSend[messagesToSend.length - 1];
+            if (latestPiped?.id && !latestPiped.is_from_me) {
+              channel
+                .addReaction?.(chatJid, latestPiped.id, 'eyes')
+                ?.catch((err) =>
+                  logger.debug({ chatJid, err }, 'Failed to add reaction'),
+                );
+              channel.setActiveThread?.(chatJid, latestPiped.id);
+            }
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);

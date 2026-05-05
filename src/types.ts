@@ -139,6 +139,16 @@ export interface Channel {
   // Optional: delete a message. Telegram has a 48h window — implementations
   // should resolve without throwing when the message is too old or missing.
   deleteMessage?(jid: string, messageId: string): Promise<void>;
+  // Optional: add an emoji reaction to a message. Used as a lightweight ack
+  // ("I see you, processing") when the bot starts working on a message.
+  // Implementations should resolve without throwing on duplicate-reaction
+  // errors so callers don't have to deduplicate.
+  addReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
+  // Optional: route subsequent outbound messages for `jid` into a reply
+  // thread anchored on `threadId`. Slack uses this as `thread_ts`. Callers
+  // are responsible for clearing the context when processing ends.
+  setActiveThread?(jid: string, threadId: string): void;
+  clearActiveThread?(jid: string): void;
 }
 
 // Callback type that channels use to deliver inbound messages
