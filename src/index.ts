@@ -339,10 +339,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         channel
           .sendMessage(chatJid, msg)
           .catch((err) =>
-            logger.warn(
-              { chatJid, err },
-              'Failed to send silence-ack message',
-            ),
+            logger.warn({ chatJid, err }, 'Failed to send silence-ack message'),
           );
       }
       silenceAckTimer = null;
