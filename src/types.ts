@@ -42,6 +42,11 @@ export interface ContainerConfig {
   // does more harm than good (e.g. tool-use loops where the agent shouldn't
   // remember last-week's state). Trade-off: agent loses cross-session memory.
   freshSessionEachTurn?: boolean;
+  // If true, the orchestrator skips the silence-ack ("Lucrez..." / "Working
+  // on it...") fallback for this group. Use for client-facing or production
+  // bots where the chat-feels-alive nudge is unprofessional. Personal bots
+  // (telegram_main, telegram_taskmaster) keep it for solo-chat ergonomics.
+  silenceAckDisabled?: boolean;
 }
 
 export interface RegisteredGroup {

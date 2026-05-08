@@ -333,8 +333,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Pick the channel-appropriate ack pool: Slack workspaces want English,
   // Telegram (Taskmaster) keeps the Romanian defaults.
-  const ackPool =
-    SILENCE_ACK_MESSAGES_BY_CHANNEL[channel.name] || SILENCE_ACK_MESSAGES;
+  // Per-group opt-out for silence-ack: client-facing bots (CapYear in
+  // rekon's Slack, etc.) skip the "Lucrez..." nudge — the affordance is for
+  // personal solo-chats, not production. Falls back to channel-level pool
+  // when not overridden.
+  const ackPool = group.containerConfig?.silenceAckDisabled
+    ? []
+    : SILENCE_ACK_MESSAGES_BY_CHANNEL[channel.name] || SILENCE_ACK_MESSAGES;
   let silenceAckTimer: ReturnType<typeof setTimeout> | null = null;
   if (SILENCE_ACK_MS > 0 && ackPool.length > 0) {
     silenceAckTimer = setTimeout(() => {
