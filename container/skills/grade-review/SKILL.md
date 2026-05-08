@@ -1,12 +1,12 @@
 ---
 name: grade-review
-description: Process Monica's CapYear grade verification queue. Use whenever the user sends `/review`, says "review", asks to "check grades", "process pending", "verify scores", anything similar in the CapYear Grades group, OR sends a `[callback] data=...` message (which is how inline-button taps arrive — load session_state.json and act on the encoded action). Calls bot_cli.py to fetch pending decisions and presents them with inline keyboards (Telegram Bot API or Slack Block Kit).
+description: Process Monica's CapYear grade verification queue. Use whenever the user asks to "check grades", "process pending", "verify scores", "what's pending", or anything similar in the CapYear Grades group, OR sends a `[callback] data=...` message (which is how inline-button taps arrive — load session_state.json and act on the encoded action), OR sends a `[Document: ...csv]` message (NHA CSV attachment — acknowledge and update the active CSV pointer). There is no slash command — natural-language phrasing only. Calls bot_cli.py to fetch pending decisions and presents them with inline keyboards (Telegram Bot API or Slack Block Kit).
 allowed-tools: Bash, Read, Write, Glob, mcp__nanoclaw__send_message, mcp__nanoclaw__send_message_with_keyboard, mcp__nanoclaw__edit_message, mcp__nanoclaw__delete_message
 ---
 
 # Grade Review (CapYear)
 
-Trigger: `/review`, "check grades", "process pending", "verify scores", "let's review". For ambiguous chat, do NOT invoke — reply naturally.
+Trigger: "check grades", "process pending", "verify scores", "what's pending", or any similar natural-language phrasing. There is no slash command. For ambiguous chat, do NOT invoke — reply naturally.
 
 ## Receiving a fresh NHA CSV (chat attachment)
 
@@ -15,18 +15,18 @@ at `/workspace/group/attachments/<filename>.csv` and you receive a message
 that looks like `[Document: <name>.csv] (/workspace/group/attachments/<name>.csv)`.
 
 Action:
-1. Acknowledge: "Got the new NHA CSV. I'll use it on the next /review."
+1. Acknowledge: "Got the new NHA CSV. I'll use it the next time you ask for grades."
 2. Save the path to `/workspace/group/active_nha_csv.txt` (one-line file with
    the absolute path). Use Write tool.
-3. On every subsequent `/review`, read that file first; if present and the
-   path still exists, pass `--nha <path>` to `bot_cli.py fetch-pending`
+3. On every subsequent grade-check request, read that file first; if present
+   and the path still exists, pass `--nha <path>` to `bot_cli.py fetch-pending`
    (with `--force` to skip cache).
 4. If user sends a NEW CSV later, overwrite the file with the new path.
 
 If `/workspace/group/active_nha_csv.txt` is missing or points to a deleted
 file, fall back to the default CSV (no `--nha` flag).
 
-## Three-step flow on `/review`
+## Three-step flow when asked to check grades
 
 1. **Acknowledge** with `mcp__nanoclaw__send_message` text=`"Fetching pending submissions..."` (LW scrape can take 30-90s on the first cold call).
 
@@ -109,7 +109,7 @@ Chat platforms (Telegram and Slack alike) are NOT end-to-end encrypted for bot c
 
 ## Don't
 
-- Don't run `fetch-pending` more than once per `/review` (cache handles repeats).
+- Don't run `fetch-pending` more than once per request (cache handles repeats).
 - Don't write to LW without an explicit Monica tap (Interactive invariant).
 - Don't include full emails / submission_ids in any message except the on-demand Details view.
 - Don't skip the post-submit `delete_message` call — PII hygiene is a policy requirement, not a nice-to-have.
