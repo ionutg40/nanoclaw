@@ -228,6 +228,25 @@ export class GroupQueue {
     state.isTaskContainer = false;
     state.pendingMessages = false;
     this.activeCount++;
+    // Clear any leftover _close sentinel from the previous container's late
+    // notifyIdle callback — without this, a fast-cycling group can pick up
+    // the prior run's close signal and immediately wind down (Reliability #9
+    // fix). Best-effort: if the file doesn't exist, unlink throws ENOENT
+    // which we ignore.
+    if (state.groupFolder) {
+      const closePath = path.join(
+        DATA_DIR,
+        'ipc',
+        state.groupFolder,
+        'input',
+        '_close',
+      );
+      try {
+        fs.unlinkSync(closePath);
+      } catch {
+        // ignore ENOENT
+      }
+    }
 
     logger.debug(
       { groupJid, reason, activeCount: this.activeCount },
@@ -263,6 +282,21 @@ export class GroupQueue {
     state.isTaskContainer = true;
     state.runningTaskId = task.id;
     this.activeCount++;
+    // Same _close cleanup as runForGroup (Reliability #9 fix).
+    if (state.groupFolder) {
+      const closePath = path.join(
+        DATA_DIR,
+        'ipc',
+        state.groupFolder,
+        'input',
+        '_close',
+      );
+      try {
+        fs.unlinkSync(closePath);
+      } catch {
+        // ignore ENOENT
+      }
+    }
 
     logger.debug(
       { groupJid, taskId: task.id, activeCount: this.activeCount },
@@ -386,7 +420,7 @@ export class GroupQueue {
     }
   }
 
-  async shutdown(_gracePeriodMs: number): Promise<void> {
+  async shutdown(gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
 
     // Count active containers but don't kill them — they'll finish on their own
@@ -403,5 +437,20 @@ export class GroupQueue {
       { activeCount: this.activeCount, detachedContainers: activeContainers },
       'GroupQueue shutting down (containers detached, not killed)',
     );
+
+    // Wait for in-flight runForGroup / runTask Promises to settle so any
+    // pending channel.sendMessage finishes before the host exits — without
+    // this, the final reply for a question answered just before SIGTERM
+    // never lands (Reliability #8 fix).
+    const start = Date.now();
+    while (this.activeCount > 0 && Date.now() - start < gracePeriodMs) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (this.activeCount > 0) {
+      logger.warn(
+        { activeCount: this.activeCount, gracePeriodMs },
+        'Shutdown grace exhausted — some groups still active, host will exit anyway',
+      );
+    }
   }
 }

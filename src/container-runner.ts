@@ -272,9 +272,12 @@ async function buildContainerArgs(
   if (onecliApplied) {
     logger.info({ containerName }, 'OneCLI gateway config applied');
   } else {
-    logger.warn(
-      { containerName },
-      'OneCLI gateway not reachable — container will have no credentials',
+    // Promote from warn to error — without OneCLI the agent has no API
+    // credentials and will hit 401 on first SDK call. Operators MUST notice
+    // this (Reliability #6 fix).
+    logger.error(
+      { containerName, agentIdentifier },
+      'OneCLI gateway not reachable — agent will fail with 401 on first API call. Check `onecli status` and gateway connectivity.',
     );
   }
 
@@ -514,13 +517,29 @@ export async function runContainerAgent(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
-          outputChain.then(() => {
-            resolve({
-              status: 'success',
-              result: null,
-              newSessionId,
+          outputChain
+            .then(() => {
+              resolve({
+                status: 'success',
+                result: null,
+                newSessionId,
+              });
+            })
+            .catch((err) => {
+              // Without .catch, an outputChain rejection (e.g. sendMessage
+              // throwing on a Slack rate-limit) would leave the runContainerAgent
+              // Promise pending forever — state.active stays true and wedges
+              // the group queue (Reliability #10 fix).
+              logger.error(
+                { group: group.name, err },
+                'outputChain rejected during idle-cleanup resolve',
+              );
+              resolve({
+                status: 'error',
+                result: null,
+                error: `outputChain failed: ${(err as Error)?.message || String(err)}`,
+              });
             });
-          });
           return;
         }
 
@@ -628,17 +647,31 @@ export async function runContainerAgent(
 
       // Streaming mode: wait for output chain to settle, return completion marker
       if (onOutput) {
-        outputChain.then(() => {
-          logger.info(
-            { group: group.name, duration, newSessionId },
-            'Container completed (streaming mode)',
-          );
-          resolve({
-            status: 'success',
-            result: null,
-            newSessionId,
+        outputChain
+          .then(() => {
+            logger.info(
+              { group: group.name, duration, newSessionId },
+              'Container completed (streaming mode)',
+            );
+            resolve({
+              status: 'success',
+              result: null,
+              newSessionId,
+            });
+          })
+          .catch((err) => {
+            // See companion .catch above — without it, a sendMessage
+            // rejection wedges state.active (Reliability #10 fix).
+            logger.error(
+              { group: group.name, err },
+              'outputChain rejected during streaming completion',
+            );
+            resolve({
+              status: 'error',
+              result: null,
+              error: `outputChain failed: ${(err as Error)?.message || String(err)}`,
+            });
           });
-        });
         return;
       }
 
@@ -730,7 +763,16 @@ export function writeTasksSnapshot(
     : tasks.filter((t) => t.groupFolder === groupFolder);
 
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
-  fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
+  // Atomic write: SIGTERM / OOM-kill mid-write would otherwise leave a
+  // truncated JSON file that fails JSON.parse on the next agent boot
+  // (Reliability #2 fix). Writing to a tmp file + rename is atomic on POSIX.
+  writeJsonAtomic(tasksFile, filteredTasks);
+}
+
+function writeJsonAtomic(target: string, data: unknown): void {
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, target);
 }
 
 export interface AvailableGroup {
@@ -758,15 +800,9 @@ export function writeGroupsSnapshot(
   const visibleGroups = isMain ? groups : [];
 
   const groupsFile = path.join(groupIpcDir, 'available_groups.json');
-  fs.writeFileSync(
-    groupsFile,
-    JSON.stringify(
-      {
-        groups: visibleGroups,
-        lastSync: new Date().toISOString(),
-      },
-      null,
-      2,
-    ),
-  );
+  // Atomic write — see writeTasksSnapshot. (Reliability #2 fix)
+  writeJsonAtomic(groupsFile, {
+    groups: visibleGroups,
+    lastSync: new Date().toISOString(),
+  });
 }

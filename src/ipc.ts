@@ -278,9 +278,25 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   throw unlinkErr;
               }
             } catch (err) {
+              // Classify so operators can tell parse-fail (file is malformed,
+              // retry won't help → quarantine) from runtime-fail (DB write
+              // may have already succeeded, requeueing would double-apply).
+              // We still quarantine in both cases to bound retry, but the
+              // distinct log message lets ops decide whether to manually
+              // restore from errors/ (Reliability #4 mitigation; full
+              // idempotent retry needs schema work, deferred).
+              const isParseError = err instanceof SyntaxError;
               logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC task',
+                {
+                  file,
+                  sourceGroup,
+                  err,
+                  classification: isParseError ? 'parse_error' : 'runtime_error',
+                  hint: isParseError
+                    ? 'File malformed; safe to delete'
+                    : 'May have partially applied; check DB state before manual restore',
+                },
+                'Error processing IPC task — quarantining',
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
@@ -599,6 +615,25 @@ export async function processTaskIpc(
         // Preserve isMain from the existing registration so IPC config
         // updates (e.g. adding additionalMounts) don't strip the flag.
         const existingGroup = registeredGroups[data.jid];
+        // Refuse silent folder swap on re-registration: if a JID already
+        // owns one folder and a new register_group call points at a
+        // different folder, the on-disk group dir would change while
+        // isMain is preserved — a half-initialized group with empty
+        // CLAUDE.md / no skills routes the next message to a broken
+        // state. Folder migration must be a deliberate operation
+        // (deregister + register), not an accidental field tweak
+        // (Reliability #7 fix).
+        if (existingGroup && existingGroup.folder !== data.folder) {
+          logger.warn(
+            {
+              jid: data.jid,
+              existingFolder: existingGroup.folder,
+              attemptedFolder: data.folder,
+            },
+            'register_group attempted to change folder for existing JID — refusing. Use deregister+register for migration.',
+          );
+          break;
+        }
         deps.registerGroup(data.jid, {
           name: data.name,
           folder: data.folder,

@@ -123,7 +123,11 @@ const SILENCE_ACK_DEFAULTS_EN: string[] = [
 
 export const SILENCE_ACK_MESSAGES: string[] =
   process.env.SILENCE_ACK_MESSAGE !== undefined
-    ? process.env.SILENCE_ACK_MESSAGE === ''
+    ? // Treat any whitespace-only override as 'disable'. Operators editing
+      // .env via systemd EnvironmentFile sometimes set ` ` or `""` thinking
+      // that disables the ack — both used to slip through and produce blank
+      // bubbles in chat (ADV-9).
+      process.env.SILENCE_ACK_MESSAGE.trim() === ''
       ? []
       : [process.env.SILENCE_ACK_MESSAGE]
     : SILENCE_ACK_DEFAULTS;

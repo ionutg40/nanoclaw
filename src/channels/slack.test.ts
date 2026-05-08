@@ -72,6 +72,9 @@ vi.mock('@slack/bolt', () => ({
           },
         }),
       },
+      reactions: {
+        add: vi.fn().mockResolvedValue({ ok: true }),
+      },
     };
 
     constructor(opts: any) {
@@ -769,6 +772,29 @@ describe('SlackChannel', () => {
 
       // 4000 + 4000 + 500 = 3 messages
       expect(currentApp().client.chat.postMessage).toHaveBeenCalledTimes(3);
+    });
+
+    it('chunked send: requeues only the unsent suffix when a chunk fails mid-stream (ADV-4)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const longText = 'A'.repeat(4000) + 'B'.repeat(4000) + 'C'.repeat(500);
+      currentApp()
+        .client.chat.postMessage.mockResolvedValueOnce({ ok: true })
+        .mockRejectedValueOnce(new Error('rate_limited'));
+
+      await channel.sendMessage('slack:C0123456789', longText);
+
+      // After mid-stream failure, the queue must hold only the unsent suffix
+      // (chunks 2+3 = 4500 chars), NOT the full original 8500. Without this
+      // fix (ADV-4), a flush retry would duplicate chunk 1 (already delivered).
+      const queue = (
+        channel as unknown as { outgoingQueue: Array<{ text: string }> }
+      ).outgoingQueue;
+      expect(queue).toHaveLength(1);
+      expect(queue[0].text).toHaveLength(4500);
+      expect(queue[0].text.startsWith('B')).toBe(true);
     });
 
     it('flushes queued messages on connect', async () => {
@@ -1842,7 +1868,7 @@ describe('SlackChannel', () => {
   });
 
   describe('action_ts retry simulation (Bolt slow-ack retry)', () => {
-    it('produces SAME synthetic id on identical retry payload (orchestrator dedupes)', async () => {
+    it('drops duplicate retry at the action handler so onMessage runs exactly once (ADV-8)', async () => {
       const onMessage = vi.fn();
       const opts = createTestOpts({ onMessage });
       new SlackChannel(opts);
@@ -1858,17 +1884,45 @@ describe('SlackChannel', () => {
         },
         client: currentApp().client,
       };
-      // Slack delivers the SAME payload twice when ack was slow on first try
+      // Slack delivers the SAME payload twice when ack was slow on first try.
+      // Dedup must catch the retry BEFORE it reaches onMessage — otherwise any
+      // non-idempotent side effect downstream fires twice.
       for (const { handler } of currentApp().actionHandlers) {
         await handler(samePayload);
         await handler(samePayload);
       }
 
+      expect(onMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('lets a legitimate re-click of the same button (different action_ts) through', async () => {
+      const onMessage = vi.fn();
+      const opts = createTestOpts({ onMessage });
+      new SlackChannel(opts);
+
+      const ack = vi.fn().mockResolvedValue(undefined);
+      const basePayload = {
+        ack,
+        body: {
+          channel: { id: 'C0123456789' },
+          message: { ts: '1704067200.000' },
+          user: { id: 'U_USER_456' },
+        },
+        client: currentApp().client,
+      };
+      // Two distinct action_ts → two legit clicks → both delivered.
+      for (const { handler } of currentApp().actionHandlers) {
+        await handler({
+          ...basePayload,
+          action: { action_id: 'a:7f3a', action_ts: '1704067210.111' },
+        });
+        await handler({
+          ...basePayload,
+          action: { action_id: 'a:7f3a', action_ts: '1704067220.222' },
+        });
+      }
+
       expect(onMessage).toHaveBeenCalledTimes(2);
-      const id1 = onMessage.mock.calls[0][1].id;
-      const id2 = onMessage.mock.calls[1][1].id;
-      // Identical ids let downstream orchestrator dedupe Bolt retries cleanly
-      expect(id1).toBe(id2);
     });
   });
 
@@ -2271,6 +2325,71 @@ describe('SlackChannel', () => {
       expect(() => new SlackChannel(createTestOpts())).toThrow(
         'SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in .env',
       );
+    });
+  });
+
+  // --- thread anchor + reaction id-shape guards (ADV-1) ---
+
+  describe('thread anchor / reaction id-shape guards', () => {
+    it('setActiveThread accepts real Slack ts and threads outbound replies', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      channel.setActiveThread('slack:C0123456789', '1704067200.123456');
+      await channel.sendMessage('slack:C0123456789', 'Hello in thread');
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel: 'C0123456789',
+          text: 'Hello in thread',
+          thread_ts: '1704067200.123456',
+        }),
+      );
+    });
+
+    it('setActiveThread rejects synthetic composite id (button-click callback) so chat.postMessage stays unthreaded', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // This is what slack.ts emits at line ~570 for a button click.
+      const syntheticId = '1704067200.000000:b:approve:K1:1704067210.111';
+      channel.setActiveThread('slack:C0123456789', syntheticId);
+      await channel.sendMessage('slack:C0123456789', 'Hello');
+
+      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
+      expect(call).not.toHaveProperty('thread_ts');
+    });
+
+    it('addReaction skips non-ts ids (button-click callbacks) instead of 400ing reactions.add', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const syntheticId = '1704067200.000000:b:approve:K1:1704067210.111';
+      await channel.addReaction('slack:C0123456789', syntheticId, 'eyes');
+
+      expect(currentApp().client.reactions.add).not.toHaveBeenCalled();
+    });
+
+    it('addReaction calls reactions.add for real Slack ts', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.reactions.add.mockResolvedValueOnce({ ok: true });
+      await channel.addReaction(
+        'slack:C0123456789',
+        '1704067200.123456',
+        'eyes',
+      );
+
+      expect(currentApp().client.reactions.add).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.123456',
+        name: 'eyes',
+      });
     });
   });
 

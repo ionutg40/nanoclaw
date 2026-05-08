@@ -289,9 +289,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // its current adapter) silently no-op via optional chaining. Fire-and-forget
   // so a Slack hiccup never blocks the agent run.
   const latestInbound = missedMessages[missedMessages.length - 1];
-  if (latestInbound?.id && !latestInbound.is_from_me) {
+  // For button clicks, `id` is a synthetic composite (originalMsgTs:data:actionTs)
+  // — passing it as Slack thread_ts would loop the queue with invalid_thread_ts.
+  // `callback_message_id` holds the real Slack ts of the message the button is on.
+  const threadAnchor =
+    latestInbound?.callback_message_id || latestInbound?.id;
+  if (threadAnchor && !latestInbound.is_from_me) {
     channel
-      .addReaction?.(chatJid, latestInbound.id, 'eyes')
+      .addReaction?.(chatJid, threadAnchor, 'eyes')
       ?.catch((err) =>
         logger.debug({ chatJid, err }, 'Failed to add reaction'),
       );
@@ -301,7 +306,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // existing Slack thread, Slack normalizes our `thread_ts` back to that
     // parent thread (sub-threads aren't a thing on the platform), which is
     // a graceful fallback rather than a wrong target.
-    channel.setActiveThread?.(chatJid, latestInbound.id);
+    channel.setActiveThread?.(chatJid, threadAnchor);
   }
   let hadError = false;
   let outputSentToUser = false;
@@ -346,47 +351,59 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, SILENCE_ACK_MS);
   }
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
-        // First real output reached the user — cancel the silence-ack fallback
-        // (we no longer need to insert "Lucrez...") but keep refreshing typing
-        // because the agent may still be working on follow-up output.
-        if (silenceAckTimer) {
-          clearTimeout(silenceAckTimer);
-          silenceAckTimer = null;
+  let output: 'success' | 'error';
+  try {
+    output = await runAgent(group, prompt, chatJid, async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
+        if (text) {
+          // Cancel silence-ack BEFORE awaiting sendMessage so a slow Slack
+          // post can't fire the ack timer during the await window — without
+          // this, the "Lucrez..." ack lands AFTER the real reply (inverted
+          // ordering, see ADV-3).
+          if (silenceAckTimer) {
+            clearTimeout(silenceAckTimer);
+            silenceAckTimer = null;
+          }
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
         }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    });
+  } finally {
+    // ADV-2: cleanup MUST run even if runAgent throws — otherwise typingTimer
+    // keeps firing every TYPING_REFRESH_MS for the lifetime of the process,
+    // and clearActiveThread is skipped, so subsequent unrelated runs thread
+    // off this run's anchor.
+    if (typingTimer) clearInterval(typingTimer);
+    if (silenceAckTimer) clearTimeout(silenceAckTimer);
+    try {
+      await channel.setTyping?.(chatJid, false);
+    } catch (err) {
+      logger.debug({ chatJid, err }, 'Failed to clear typing indicator');
     }
-  });
-
-  if (typingTimer) clearInterval(typingTimer);
-  if (silenceAckTimer) clearTimeout(silenceAckTimer);
-  await channel.setTyping?.(chatJid, false);
-  // Release the thread anchor so post-run messages (scheduled tasks,
-  // remote-control outputs) land at channel root again.
-  channel.clearActiveThread?.(chatJid);
-  if (idleTimer) clearTimeout(idleTimer);
+    // Release the thread anchor so post-run messages (scheduled tasks,
+    // remote-control outputs) land at channel root again.
+    channel.clearActiveThread?.(chatJid);
+    if (idleTimer) clearTimeout(idleTimer);
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
@@ -615,13 +632,15 @@ async function startMessageLoop(): Promise<void> {
             // too. Without this, every reply for a long-lived container kept
             // collapsing into the first message's thread.
             const latestPiped = messagesToSend[messagesToSend.length - 1];
-            if (latestPiped?.id && !latestPiped.is_from_me) {
+            const pipedAnchor =
+              latestPiped?.callback_message_id || latestPiped?.id;
+            if (pipedAnchor && !latestPiped.is_from_me) {
               channel
-                .addReaction?.(chatJid, latestPiped.id, 'eyes')
+                .addReaction?.(chatJid, pipedAnchor, 'eyes')
                 ?.catch((err) =>
                   logger.debug({ chatJid, err }, 'Failed to add reaction'),
                 );
-              channel.setActiveThread?.(chatJid, latestPiped.id);
+              channel.setActiveThread?.(chatJid, pipedAnchor);
             }
           } else {
             // No active container — enqueue for a new one
@@ -680,8 +699,22 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    // queue.shutdown now waits up to graceMs for in-flight runForGroup
+    // Promises (which include channel.sendMessage of the final reply) so
+    // SIGTERM mid-answer doesn't drop the user's last message
+    // (Reliability #8 fix). Detached containers continue running with
+    // --rm cleanup; persistent state is in groups/<folder>/. The IPC
+    // watcher dying mid-write of a detached container's late output is
+    // a known architectural limitation (Reliability #1), recovered on
+    // the next host start.
     await queue.shutdown(10000);
-    for (const ch of channels) await ch.disconnect();
+    for (const ch of channels) {
+      try {
+        await ch.disconnect();
+      } catch (err) {
+        logger.warn({ err, channel: ch.name }, 'Channel disconnect failed during shutdown');
+      }
+    }
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -801,12 +834,24 @@ async function main(): Promise<void> {
   if (preWarmGroups.length > 0) {
     const { spawn } = await import('child_process');
     const { CONTAINER_IMAGE } = await import('./config.js');
-    spawn('docker', ['run', '--rm', CONTAINER_IMAGE, 'true'], {
+    const preWarmProc = spawn('docker', ['run', '--rm', CONTAINER_IMAGE, 'true'], {
       detached: true,
       stdio: 'ignore',
-    }).on('error', (err) => {
-      logger.debug({ err }, 'Pre-warm spawn failed (non-fatal)');
     });
+    // Promote spawn errors and dockerd-hung scenarios from `debug` to `warn`
+    // so a silently-failing pre-warm doesn't quietly regress cold-start
+    // performance (Reliability #5 fix).
+    preWarmProc.on('error', (err) => {
+      logger.warn({ err }, 'Pre-warm docker spawn failed — first real spawn will pay full cold-start cost');
+    });
+    const preWarmTimeout = setTimeout(() => {
+      logger.warn(
+        { pid: preWarmProc.pid },
+        'Pre-warm did not exit within 10s — likely dockerd hung; first real spawn will be slow',
+      );
+    }, 10_000);
+    preWarmProc.on('exit', () => clearTimeout(preWarmTimeout));
+    preWarmProc.unref();
     logger.info(
       { groups: preWarmGroups.map((g) => g.folder), image: CONTAINER_IMAGE },
       'Pre-warming agent container image cache',

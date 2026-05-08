@@ -164,6 +164,14 @@ export function initDatabase(): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  // WAL gives better crash safety than the default rollback journal on
+  // unclean shutdown — without it, a setRegisteredGroup INSERT can be
+  // rolled back when the host SIGKILLs before checkpoint flush, leaving
+  // an on-disk group folder with no DB row (Reliability #3 fix). NORMAL
+  // sync trades a tiny window of OS-buffer-loss-on-power-loss for ~10x
+  // throughput vs FULL — acceptable for this workload.
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
   createSchema(db);
 
   // Migrate from JSON files if they exist
