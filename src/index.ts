@@ -292,8 +292,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // For button clicks, `id` is a synthetic composite (originalMsgTs:data:actionTs)
   // — passing it as Slack thread_ts would loop the queue with invalid_thread_ts.
   // `callback_message_id` holds the real Slack ts of the message the button is on.
-  const threadAnchor =
-    latestInbound?.callback_message_id || latestInbound?.id;
+  const threadAnchor = latestInbound?.callback_message_id || latestInbound?.id;
   if (threadAnchor && !latestInbound.is_from_me) {
     channel
       .addReaction?.(chatJid, threadAnchor, 'eyes')
@@ -712,7 +711,10 @@ async function main(): Promise<void> {
       try {
         await ch.disconnect();
       } catch (err) {
-        logger.warn({ err, channel: ch.name }, 'Channel disconnect failed during shutdown');
+        logger.warn(
+          { err, channel: ch.name },
+          'Channel disconnect failed during shutdown',
+        );
       }
     }
     process.exit(0);
@@ -834,15 +836,22 @@ async function main(): Promise<void> {
   if (preWarmGroups.length > 0) {
     const { spawn } = await import('child_process');
     const { CONTAINER_IMAGE } = await import('./config.js');
-    const preWarmProc = spawn('docker', ['run', '--rm', CONTAINER_IMAGE, 'true'], {
-      detached: true,
-      stdio: 'ignore',
-    });
+    const preWarmProc = spawn(
+      'docker',
+      ['run', '--rm', CONTAINER_IMAGE, 'true'],
+      {
+        detached: true,
+        stdio: 'ignore',
+      },
+    );
     // Promote spawn errors and dockerd-hung scenarios from `debug` to `warn`
     // so a silently-failing pre-warm doesn't quietly regress cold-start
     // performance (Reliability #5 fix).
     preWarmProc.on('error', (err) => {
-      logger.warn({ err }, 'Pre-warm docker spawn failed — first real spawn will pay full cold-start cost');
+      logger.warn(
+        { err },
+        'Pre-warm docker spawn failed — first real spawn will pay full cold-start cost',
+      );
     });
     const preWarmTimeout = setTimeout(() => {
       logger.warn(

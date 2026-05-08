@@ -291,7 +291,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   file,
                   sourceGroup,
                   err,
-                  classification: isParseError ? 'parse_error' : 'runtime_error',
+                  classification: isParseError
+                    ? 'parse_error'
+                    : 'runtime_error',
                   hint: isParseError
                     ? 'File malformed; safe to delete'
                     : 'May have partially applied; check DB state before manual restore',
