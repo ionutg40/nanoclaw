@@ -819,6 +819,88 @@ describe('SlackChannel', () => {
         text: 'Second queued',
       });
     });
+
+    // T2.1: <reply>...</reply> marker extraction
+    it('extracts content inside <reply> markers and posts only that', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'Let me think about this. <reply>Done, 86 cleared.</reply> Internal note: refresh next.',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Done, 86 cleared.',
+      });
+    });
+
+    it('concatenates multiple <reply> blocks with blank lines', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '<reply>Part one.</reply> some planning <reply>Part two.</reply>',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Part one.\n\nPart two.',
+      });
+    });
+
+    it('passes through whole text when no <reply> markers present (loose fallback)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'Daily heartbeat: 86 cleared, 14 held.',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Daily heartbeat: 86 cleared, 14 held.',
+      });
+    });
+
+    it('falls back to whole text when <reply> is empty after trim', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'Whole text. <reply>   </reply>',
+      );
+
+      // Falls back to whole text, untouched.
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Whole text. <reply>   </reply>',
+      });
+    });
+
+    it('is case-insensitive on the tag name (<Reply>, <REPLY>)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'planning <Reply>Real reply.</Reply> trailing',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Real reply.',
+      });
+    });
   });
 
   // --- ownsJid ---
