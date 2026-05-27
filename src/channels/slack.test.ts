@@ -901,6 +901,122 @@ describe('SlackChannel', () => {
         text: 'Real reply.',
       });
     });
+
+    // T4.2: <private_postscript_to:USERID>...</private_postscript_to> marker
+    it('strips <private_postscript_to> marker and appends as segregated postscript with mention', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '<reply>86 cleared, 14 held. <private_postscript_to:U0AJEN4CBS8>Heads-up: product=4280 retried once.</private_postscript_to></reply>',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: '86 cleared, 14 held.\n\n---\n_(note for <@U0AJEN4CBS8>:)_\nHeads-up: product=4280 retried once.',
+      });
+    });
+
+    it('appends multiple <private_postscript_to> blocks in order with their own headers', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '<reply>Daily heartbeat: 47 cleared.<private_postscript_to:U0AAA>First note.</private_postscript_to><private_postscript_to:U0BBB>Second note.</private_postscript_to></reply>',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Daily heartbeat: 47 cleared.\n\n---\n_(note for <@U0AAA>:)_\nFirst note.\n\n_(note for <@U0BBB>:)_\nSecond note.',
+      });
+    });
+
+    it('passes through whole text when no <private_postscript_to> marker present (loose fallback)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '<reply>Just a regular heartbeat, no postscripts.</reply>',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Just a regular heartbeat, no postscripts.',
+      });
+    });
+
+    it('drops empty <private_postscript_to> body silently and keeps main text', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '<reply>Main reply. <private_postscript_to:U0AJEN4CBS8>   </private_postscript_to></reply>',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Main reply.',
+      });
+    });
+
+    it('is case-insensitive on the <private_postscript_to> tag name', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '<reply>Heartbeat.<Private_Postscript_To:U0AJEN4CBS8>Adrian note.</Private_Postscript_To></reply>',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Heartbeat.\n\n---\n_(note for <@U0AJEN4CBS8>:)_\nAdrian note.',
+      });
+    });
+
+    it('emits postscript alone (no separator) when there is no main text', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '<reply><private_postscript_to:U0AJEN4CBS8>Adrian-only one-liner.</private_postscript_to></reply>',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: '_(note for <@U0AJEN4CBS8>:)_\nAdrian-only one-liner.',
+      });
+    });
+
+    it('handles postscript outside <reply> markers (lost by extractReplyMarkers, documented behavior)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Per the contract, postscript markers OUTSIDE the <reply> block are
+      // discarded along with all other non-reply content. This test pins the
+      // behavior so a future change cannot silently start preserving them.
+      await channel.sendMessage(
+        'slack:C0123456789',
+        '<reply>Heartbeat.</reply><private_postscript_to:U0AJEN4CBS8>This is lost.</private_postscript_to>',
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Heartbeat.',
+      });
+    });
   });
 
   // --- ownsJid ---
