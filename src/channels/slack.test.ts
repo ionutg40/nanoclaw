@@ -674,7 +674,99 @@ describe('SlackChannel', () => {
 
   // --- sendMessage ---
 
+  describe('sendMessage — T4.24 internal-meta prose gate', () => {
+    const REAL_LEAKED_EXAMPLES = [
+      "Sent. Waiting for Monica's tap.",
+      "Acknowledged — that's the batch submit task I already read the output from... No further action needed.",
+      'Batch processed by Alberto',
+      'The task is complete for this turn... No further work to track.',
+    ];
+
+    it.each(REAL_LEAKED_EXAMPLES)(
+      'blocks the real leaked example: %s',
+      async (leaked) => {
+        const opts = createTestOpts();
+        const channel = new SlackChannel(opts);
+        await channel.connect();
+
+        await channel.sendMessage('slack:C0AU7PHUJBX', leaked);
+
+        expect(currentApp().client.chat.postMessage).not.toHaveBeenCalled();
+      },
+    );
+
+    it('blocks a variant even when wrapped in <reply> markers', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0AU7PHUJBX',
+        '<reply>Acknowledged. No further action needed.</reply>',
+      );
+
+      expect(currentApp().client.chat.postMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not block a legitimate daily drain summary', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0AU7PHUJBX',
+        "As of this morning's 12:30 run, 86 cleared and 14 held. The held bucket is mostly the Practice Exam Grad Out cohort that Stephanie reviews manually. Let me know if you want a fresh run on demand.",
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalled();
+    });
+
+    it('does not block a legitimate refusal explanation', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0AU7PHUJBX',
+        "I'm holding this one for manual review — the NHA score and the self-report differ by more than usual and I'd rather a human confirm before I write it.",
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalled();
+    });
+
+    it('does not block a legitimate correction-card style message', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0AU7PHUJBX',
+        "Corrected one grade: the student reported 78% but NHA has them at 91%. Updated to match NHA, per the standing rule that NHA always wins.",
+      );
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalled();
+    });
+  });
+
   describe('sendMessage', () => {
+    it('scrubs internal server paths and IPs from outbound text (opsec net)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'slack:C0123456789',
+        'venv at /home/fasty/rt_arnold_capyear/active/grade_verifier/venv/bin/python3 and /usr/bin/python3.11 on 95.217.59.112',
+      );
+
+      const sent = (currentApp().client.chat.postMessage as any).mock
+        .calls[0][0].text as string;
+      expect(sent).not.toContain('/home/fasty');
+      expect(sent).not.toContain('/usr/bin/python3.11');
+      expect(sent).not.toContain('95.217.59.112');
+      expect(sent).toContain('[internal path]');
+    });
+
     it('sends message via Slack client', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
