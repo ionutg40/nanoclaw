@@ -741,7 +741,7 @@ describe('SlackChannel', () => {
 
       await channel.sendMessage(
         'slack:C0AU7PHUJBX',
-        "Corrected one grade: the student reported 78% but NHA has them at 91%. Updated to match NHA, per the standing rule that NHA always wins.",
+        'Corrected one grade: the student reported 78% but NHA has them at 91%. Updated to match NHA, per the standing rule that NHA always wins.',
       );
 
       expect(currentApp().client.chat.postMessage).toHaveBeenCalled();
