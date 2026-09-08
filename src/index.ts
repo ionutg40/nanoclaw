@@ -34,6 +34,14 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  CAPYEAR_ALERT_DM_JID,
+  formatFailureAlert,
+  formatRecoveryMessage,
+  recordContainerFailure,
+  recordContainerSuccess,
+  type FailureStreaks,
+} from './container-failure-alert.js';
+import {
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -81,6 +89,10 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+// T11.7: consecutive container-spawn-failure tracking, keyed by group jid.
+// In-memory only (resets on process restart) — the "smallest change" per
+// the brief; the failure signal itself (nanoclaw.error.log) is durable.
+const containerFailureStreaks: FailureStreaks = new Map();
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
@@ -432,6 +444,39 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   return true;
 }
 
+// T11.7: fire the container-cannot-start DM after N consecutive spawn
+// failures for the CapYear client group (recordContainerFailure no-ops for
+// every other group), and one recovery DM when a spawn next succeeds.
+function notifyContainerFailure(
+  chatJid: string,
+  group: RegisteredGroup,
+  error: string,
+): void {
+  const { shouldAlert } = recordContainerFailure(containerFailureStreaks, chatJid);
+  if (!shouldAlert) return;
+  const alertChannel = findChannel(channels, CAPYEAR_ALERT_DM_JID);
+  if (!alertChannel) {
+    logger.warn({ chatJid }, 'No channel owns the alert DM jid, cannot send container-failure alert');
+    return;
+  }
+  alertChannel
+    .sendMessage(CAPYEAR_ALERT_DM_JID, formatFailureAlert(group.name, error))
+    .catch((err) => logger.warn({ err }, 'Failed to send container-failure alert DM'));
+}
+
+function notifyContainerRecovery(chatJid: string, group: RegisteredGroup): void {
+  const { shouldSendRecovery } = recordContainerSuccess(containerFailureStreaks, chatJid);
+  if (!shouldSendRecovery) return;
+  const alertChannel = findChannel(channels, CAPYEAR_ALERT_DM_JID);
+  if (!alertChannel) {
+    logger.warn({ chatJid }, 'No channel owns the alert DM jid, cannot send container-recovery message');
+    return;
+  }
+  alertChannel
+    .sendMessage(CAPYEAR_ALERT_DM_JID, formatRecoveryMessage(group.name))
+    .catch((err) => logger.warn({ err }, 'Failed to send container-recovery DM'));
+}
+
 async function runAgent(
   group: RegisteredGroup,
   prompt: string,
@@ -529,12 +574,15 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
+      notifyContainerFailure(chatJid, group, output.error || 'unknown error');
       return 'error';
     }
 
+    notifyContainerRecovery(chatJid, group);
     return 'success';
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
+    notifyContainerFailure(chatJid, group, err instanceof Error ? err.message : String(err));
     return 'error';
   }
 }
