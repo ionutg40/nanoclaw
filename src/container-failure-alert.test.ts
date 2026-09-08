@@ -35,7 +35,8 @@ describe('recordContainerFailure', () => {
   });
 
   it('does not re-alert on the 4th, 5th... consecutive failure', () => {
-    for (let i = 0; i < 3; i++) recordContainerFailure(streaks, CAPYEAR_ALERT_GROUP_JID);
+    for (let i = 0; i < 3; i++)
+      recordContainerFailure(streaks, CAPYEAR_ALERT_GROUP_JID);
     const fourth = recordContainerFailure(streaks, CAPYEAR_ALERT_GROUP_JID);
     const fifth = recordContainerFailure(streaks, CAPYEAR_ALERT_GROUP_JID);
     expect(fourth.shouldAlert).toBe(false);
@@ -44,7 +45,9 @@ describe('recordContainerFailure', () => {
 
   it('never alerts for a group other than the CapYear client group', () => {
     for (let i = 0; i < 5; i++) {
-      expect(recordContainerFailure(streaks, OTHER_JID).shouldAlert).toBe(false);
+      expect(recordContainerFailure(streaks, OTHER_JID).shouldAlert).toBe(
+        false,
+      );
     }
   });
 });
@@ -64,7 +67,8 @@ describe('recordContainerSuccess', () => {
   });
 
   it('sends exactly one recovery message after an alerted streak clears', () => {
-    for (let i = 0; i < 3; i++) recordContainerFailure(streaks, CAPYEAR_ALERT_GROUP_JID);
+    for (let i = 0; i < 3; i++)
+      recordContainerFailure(streaks, CAPYEAR_ALERT_GROUP_JID);
     expect(recordContainerSuccess(streaks, CAPYEAR_ALERT_GROUP_JID)).toEqual({
       shouldSendRecovery: true,
     });
@@ -75,7 +79,8 @@ describe('recordContainerSuccess', () => {
   });
 
   it('re-arms the alert after a fresh 3-failure streak post-recovery', () => {
-    for (let i = 0; i < 3; i++) recordContainerFailure(streaks, CAPYEAR_ALERT_GROUP_JID);
+    for (let i = 0; i < 3; i++)
+      recordContainerFailure(streaks, CAPYEAR_ALERT_GROUP_JID);
     recordContainerSuccess(streaks, CAPYEAR_ALERT_GROUP_JID);
     const third = (() => {
       recordContainerFailure(streaks, CAPYEAR_ALERT_GROUP_JID);
@@ -100,12 +105,17 @@ describe('formatFailureAlert', () => {
     );
     expect(msg).toContain('CapYear Client Channel');
     expect(msg).toContain('125');
-    expect(msg).toContain("Unable to find image 'nanoclaw-agent:latest' locally");
+    expect(msg).toContain(
+      "Unable to find image 'nanoclaw-agent:latest' locally",
+    );
     expect(msg).not.toContain('pull access denied');
   });
 
   it('falls back gracefully when the error string has no code', () => {
-    const msg = formatFailureAlert('CapYear Client Channel', 'some unexpected error');
+    const msg = formatFailureAlert(
+      'CapYear Client Channel',
+      'some unexpected error',
+    );
     expect(msg).toContain('unknown');
   });
 });

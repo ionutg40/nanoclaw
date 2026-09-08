@@ -25,7 +25,8 @@ export function recordContainerFailure(
   streaks: FailureStreaks,
   groupJid: string,
 ): { shouldAlert: boolean; count: number } {
-  if (groupJid !== CAPYEAR_ALERT_GROUP_JID) return { shouldAlert: false, count: 0 };
+  if (groupJid !== CAPYEAR_ALERT_GROUP_JID)
+    return { shouldAlert: false, count: 0 };
   const state = streaks.get(groupJid) || { count: 0, alerted: false };
   state.count++;
   streaks.set(groupJid, state);
@@ -39,7 +40,8 @@ export function recordContainerSuccess(
   streaks: FailureStreaks,
   groupJid: string,
 ): { shouldSendRecovery: boolean } {
-  if (groupJid !== CAPYEAR_ALERT_GROUP_JID) return { shouldSendRecovery: false };
+  if (groupJid !== CAPYEAR_ALERT_GROUP_JID)
+    return { shouldSendRecovery: false };
   const state = streaks.get(groupJid);
   const wasAlerted = state?.alerted === true;
   streaks.set(groupJid, { count: 0, alerted: false });

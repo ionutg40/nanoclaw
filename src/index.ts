@@ -452,29 +452,48 @@ function notifyContainerFailure(
   group: RegisteredGroup,
   error: string,
 ): void {
-  const { shouldAlert } = recordContainerFailure(containerFailureStreaks, chatJid);
+  const { shouldAlert } = recordContainerFailure(
+    containerFailureStreaks,
+    chatJid,
+  );
   if (!shouldAlert) return;
   const alertChannel = findChannel(channels, CAPYEAR_ALERT_DM_JID);
   if (!alertChannel) {
-    logger.warn({ chatJid }, 'No channel owns the alert DM jid, cannot send container-failure alert');
+    logger.warn(
+      { chatJid },
+      'No channel owns the alert DM jid, cannot send container-failure alert',
+    );
     return;
   }
   alertChannel
     .sendMessage(CAPYEAR_ALERT_DM_JID, formatFailureAlert(group.name, error))
-    .catch((err) => logger.warn({ err }, 'Failed to send container-failure alert DM'));
+    .catch((err) =>
+      logger.warn({ err }, 'Failed to send container-failure alert DM'),
+    );
 }
 
-function notifyContainerRecovery(chatJid: string, group: RegisteredGroup): void {
-  const { shouldSendRecovery } = recordContainerSuccess(containerFailureStreaks, chatJid);
+function notifyContainerRecovery(
+  chatJid: string,
+  group: RegisteredGroup,
+): void {
+  const { shouldSendRecovery } = recordContainerSuccess(
+    containerFailureStreaks,
+    chatJid,
+  );
   if (!shouldSendRecovery) return;
   const alertChannel = findChannel(channels, CAPYEAR_ALERT_DM_JID);
   if (!alertChannel) {
-    logger.warn({ chatJid }, 'No channel owns the alert DM jid, cannot send container-recovery message');
+    logger.warn(
+      { chatJid },
+      'No channel owns the alert DM jid, cannot send container-recovery message',
+    );
     return;
   }
   alertChannel
     .sendMessage(CAPYEAR_ALERT_DM_JID, formatRecoveryMessage(group.name))
-    .catch((err) => logger.warn({ err }, 'Failed to send container-recovery DM'));
+    .catch((err) =>
+      logger.warn({ err }, 'Failed to send container-recovery DM'),
+    );
 }
 
 async function runAgent(
@@ -582,7 +601,11 @@ async function runAgent(
     return 'success';
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
-    notifyContainerFailure(chatJid, group, err instanceof Error ? err.message : String(err));
+    notifyContainerFailure(
+      chatJid,
+      group,
+      err instanceof Error ? err.message : String(err),
+    );
     return 'error';
   }
 }
